@@ -69,8 +69,7 @@ fn hash_bytes(b: &[u8]) -> u64 {
 const EXACT_USER: u64 = 1 << 63;
 
 // Eight or nine nonzero ASCII bytes fit exactly into one word at seven
-// bits per byte. Keep the source pointer as well for lexical comparison
-// and output; only the uncommon wider keys need it during hash probes.
+// bits per byte. For short names the code also orders the IDs byte-wise.
 #[inline(always)]
 fn user_code(user: &[u8]) -> u64 {
     user_code_impl::<false>(user)
@@ -79,7 +78,7 @@ fn user_code(user: &[u8]) -> u64 {
 #[inline(always)]
 fn user_code_impl<const BMI2: bool>(user: &[u8]) -> u64 {
     if matches!(user.len(), 8 | 9) {
-        let w = u64::from_le_bytes(user[..8].try_into().unwrap());
+        let w = u64::from_be_bytes(user[..8].try_into().unwrap());
         let last = if user.len() == 9 { user[8] } else { 0 };
         const HIGH: u64 = 0x8080_8080_8080_8080;
         if w & HIGH == 0
@@ -90,12 +89,12 @@ fn user_code_impl<const BMI2: bool>(user: &[u8]) -> u64 {
             if BMI2 {
                 // The only true specialization is inside the BMI2-dispatched scanner.
                 let compact = unsafe { std::arch::x86_64::_pext_u64(w, 0x7f7f_7f7f_7f7f_7f7f) };
-                return EXACT_USER | compact | ((last as u64) << 56);
+                return EXACT_USER | (compact << 7) | u64::from(last);
             }
             let w = (w & 0x007f_007f_007f_007f) | ((w >> 1) & 0x3f80_3f80_3f80_3f80);
             let w = (w & 0x0000_3fff_0000_3fff) | ((w >> 2) & 0x0fff_c000_0fff_c000);
             let w = (w & 0x0000_0000_0fff_ffff) | ((w >> 4) & 0x00ff_ffff_f000_0000);
-            return EXACT_USER | w | ((last as u64) << 56);
+            return EXACT_USER | (w << 7) | u64::from(last);
         }
     }
     let code = hash_bytes(user) & !EXACT_USER;
@@ -115,10 +114,11 @@ fn same_user(code: u64, a: u64, b: u64) -> bool {
 
 #[inline]
 fn short_name(code: u64) -> ([u8; 8], u8) {
-    let w = (code & 0x0000_0000_0fff_ffff) | ((code & 0x00ff_ffff_f000_0000) << 4);
+    let compact = code >> 7;
+    let w = (compact & 0x0000_0000_0fff_ffff) | ((compact & 0x00ff_ffff_f000_0000) << 4);
     let w = (w & 0x0000_3fff_0000_3fff) | ((w & 0x0fff_c000_0fff_c000) << 2);
     let w = (w & 0x007f_007f_007f_007f) | ((w & 0x3f80_3f80_3f80_3f80) << 1);
-    (w.to_le_bytes(), ((code >> 56) & 127) as u8)
+    (w.to_be_bytes(), (code & 127) as u8)
 }
 
 #[inline(always)]
@@ -468,6 +468,33 @@ fn parse_ts(f: &[u8], cache: &mut DateCache) -> Option<i64> {
     parse_epoch(f)
 }
 
+#[inline(always)]
+fn parse_ts_vector<const VECTOR: bool>(f: &[u8], cache: &mut DateCache) -> Option<i64> {
+    #[cfg(target_arch = "x86_64")]
+    if VECTOR && f.len() == 13 {
+        use std::arch::x86_64::*;
+        // The overlapping reads cover all 13 bytes without crossing
+        // the field boundary. Validate unsigned digits before converting.
+        let a = u64::from_le_bytes(f[..8].try_into().unwrap());
+        let b = u64::from_le_bytes(f[5..].try_into().unwrap());
+        return unsafe {
+            let v = _mm_set_epi64x(b as i64, a as i64);
+            let digits = _mm_sub_epi8(v, _mm_set1_epi8(b'0' as i8));
+            let excess = _mm_subs_epu8(digits, _mm_set1_epi8(9));
+            if _mm_testz_si128(excess, excess) == 0 {
+                None
+            } else {
+                let pairs = _mm_maddubs_epi16(digits, _mm_set1_epi16(0x010a));
+                let quads = _mm_madd_epi16(pairs, _mm_set1_epi32(0x0001_0064));
+                let high = _mm_cvtsi128_si32(quads) as i64 * 10 + i64::from(f[4] - b'0');
+                let low = _mm_cvtsi128_si64(_mm_srli_si128::<8>(quads)) as u64;
+                Some(high * 100_000_000 + i64::from(low as u32) * 10_000 + (low >> 32) as i64)
+            }
+        };
+    }
+    parse_ts(f, cache)
+}
+
 #[cold]
 fn parse_epoch(mut f: &[u8]) -> Option<i64> {
     if f.is_empty() {
@@ -630,40 +657,97 @@ fn for_lines<'a>(data: &'a [u8], first: bool, mut f: impl FnMut(&'a [u8])) {
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512bw,bmi2")]
-unsafe fn parse_events_fast(data: &[u8], first: bool, cx: &Ctx, st: &mut P1, links: Option<&LinkTable>) {
+unsafe fn parse_events_fast<const BATCH: bool>(data: &[u8], first: bool, cx: &Ctx, st: &mut P1, links: Option<&LinkTable>) {
     use std::arch::x86_64::*;
     let mut pos = if first { memchr(b'\n', data).map_or(data.len(), |i| i + 1) } else { 0 };
     let comma = _mm512_set1_epi8(b',' as i8);
     let quote = _mm512_set1_epi8(b'"' as i8);
     let newline = _mm512_set1_epi8(b'\n' as i8);
-    while pos < data.len() {
-        let available = data.len() - pos;
-        let m = u64::MAX >> (64usize.saturating_sub(available));
-        let v = _mm512_maskz_loadu_epi8(m, data.as_ptr().add(pos).cast());
-        let newlines = _mm512_cmpeq_epi8_mask(v, newline);
-        let mut commas = u128::from(_mm512_cmpeq_epi8_mask(v, comma));
-        let mut quotes = u128::from(_mm512_cmpeq_epi8_mask(v, quote));
-        let mut len = if newlines != 0 { newlines.trailing_zeros() as usize } else { available.min(64) };
-        if len == 64 && available > 64 {
-            let m = u64::MAX >> (128usize.saturating_sub(available));
-            let v = _mm512_maskz_loadu_epi8(m, data.as_ptr().add(pos + 64).cast());
-            let newlines = _mm512_cmpeq_epi8_mask(v, newline);
-            commas |= u128::from(_mm512_cmpeq_epi8_mask(v, comma)) << 64;
-            quotes |= u128::from(_mm512_cmpeq_epi8_mask(v, quote)) << 64;
-            len = if newlines != 0 { 64 + newlines.trailing_zeros() as usize } else { available.min(128) };
-        }
-        if len == 128 && available > 128 {
-            let end = memchr(b'\n', &data[pos..]).map_or(data.len(), |i| pos + i);
-            if let Some(r) = parse_event(&data[pos..end], cx, &mut st.dates) { st.route_event(r, links); }
-            pos = end + 1;
-        } else {
-            let mask = if len == 128 { u128::MAX } else { (1u128 << len) - 1 };
-            if let Some(f) = split_masks::<7>(&data[pos..pos + len], commas & mask, quotes & mask) {
-                if let Some(r) = parse_event_fields::<true>(f, cx, &mut st.dates) { st.route_event(r, links); }
+    let mut batch = [Raw::default(); ROUTE_BATCH];
+    let mut filled = 0;
+    macro_rules! route {
+        ($row:expr) => {
+            if BATCH {
+                let row = $row;
+                let links = links.unwrap();
+                if row.data != INVALID_EVENT {
+                    prefetch_alias(row.uh, links);
+                }
+                batch[filled] = row;
+                filled += 1;
+                if filled == ROUTE_BATCH {
+                    st.route_batch(&batch, links);
+                    filled = 0;
+                }
+            } else {
+                st.route_event($row, links);
             }
-            pos += len + 1;
         }
     }
+    while pos + 128 <= data.len() {
+        let v = _mm512_loadu_si512(data.as_ptr().add(pos).cast());
+        let nl = _mm512_cmpeq_epi8_mask(v, newline);
+        let c = _mm512_cmpeq_epi8_mask(v, comma);
+        let q = _mm512_cmpeq_epi8_mask(v, quote);
+        let (len, commas, quotes) = if nl != 0 {
+            let cut = nl.trailing_zeros();
+            (cut as usize, u128::from(_bzhi_u64(c, cut)), u128::from(_bzhi_u64(q, cut)))
+        } else {
+            let v = _mm512_loadu_si512(data.as_ptr().add(pos + 64).cast());
+            let nl = _mm512_cmpeq_epi8_mask(v, newline);
+            if nl == 0 {
+                let end = memchr(b'\n', &data[pos + 128..]).map_or(data.len(), |i| pos + 128 + i);
+                if let Some(r) = parse_event(&data[pos..end], cx, &mut st.dates) { route!(r); }
+                pos = (end + 1).min(data.len());
+                continue;
+            }
+            let cut = nl.trailing_zeros();
+            let c1 = _bzhi_u64(_mm512_cmpeq_epi8_mask(v, comma), cut);
+            let q1 = _bzhi_u64(_mm512_cmpeq_epi8_mask(v, quote), cut);
+            (64 + cut as usize, u128::from(c) | (u128::from(c1) << 64), u128::from(q) | (u128::from(q1) << 64))
+        };
+        if let Some(f) = split_masks_bmi2::<7>(&data[pos..pos + len], commas, quotes) {
+            if let Some(r) = parse_event_fields::<true>(f, cx, &mut st.dates) { route!(r); }
+        }
+        pos += len + 1;
+    }
+    for_lines(&data[pos..], false, |line| {
+        if let Some(r) = parse_event(line, cx, &mut st.dates) { route!(r); }
+    });
+    if BATCH {
+        st.route_batch(&batch[..filled], links.unwrap());
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+unsafe fn split_masks_bmi2<const N: usize>(line: &[u8], mut commas: u128, quotes: u128) -> Option<[&[u8]; N]> {
+    use std::arch::x86_64::_pext_u64;
+    if commas.count_ones() as usize != N - 1 {
+        return None;
+    }
+    let starts = (commas << 1) | 1;
+    let opens = quotes & starts;
+    let ends = (commas >> 1) | (1u128 << (line.len() - 1));
+    let closes = commas.wrapping_sub(opens) & !commas & ends;
+    if quotes != (opens | closes) || opens & closes != 0 {
+        return None;
+    }
+    // Convert the quote-start marks from byte positions to field positions.
+    let lo = starts as u64;
+    let mut quoted = _pext_u64(quotes as u64, lo)
+        | (_pext_u64((quotes >> 64) as u64, (starts >> 64) as u64) << lo.count_ones());
+    let mut out = [&[][..]; N];
+    let mut start = 0;
+    for (i, field) in out.iter_mut().enumerate() {
+        let end = if i + 1 == N { line.len() } else { commas.trailing_zeros() as usize };
+        commas &= commas.wrapping_sub(1);
+        let q = (quoted & 1) as usize;
+        quoted >>= 1;
+        *field = line.get_unchecked(start + q..end - q);
+        start = end + 1;
+    }
+    Some(out)
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -826,7 +910,7 @@ fn read_table(path: &str) -> Vec<[&'static [u8]; 2]> {
 
 // ---------------------------------------------------------------- records
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Default)]
 #[repr(C)]
 struct Raw {
     eid: u64,
@@ -834,6 +918,16 @@ struct Raw {
     uh: u64,
     uptr: u64,
     data: u64,
+}
+
+const ROUTE_BATCH: usize = 32;
+
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+fn prefetch_alias(code: u64, links: &LinkTable) {
+    use std::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
+    let i = user_hash(code) as usize & links.mask;
+    unsafe { _mm_prefetch(links.tags.as_ptr().add(i).cast(), _MM_HINT_T0); }
 }
 
 struct Ev {
@@ -947,7 +1041,7 @@ fn parse_event_fields<const BMI2: bool>(f: [&[u8]; 7], cx: &Ctx, dates: &mut Dat
         _ => return Some(r),
     };
     let utc = ts.len() == 20 && ts[19] == b'Z';
-    let t = match if utc { parse_iso::<true>(ts, dates) } else { parse_ts(ts, dates) } {
+    let t = match if utc { parse_iso::<true>(ts, dates) } else { parse_ts_vector::<BMI2>(ts, dates) } {
         Some(t) if t >= cx.ws && t < cx.we => t,
         _ => return Some(r),
     };
@@ -1128,7 +1222,14 @@ fn build_links(files: &[&'static [u8]]) -> LinkTable {
         let r = find(&mut parent, i as u32) as usize;
         let b = best[r];
         components += usize::from(b == u32::MAX);
-        if b == u32::MAX || unpack(node.ptr) < unpack(nodes[b as usize].ptr) {
+        if b == u32::MAX || {
+            let other = &nodes[b as usize];
+            if node.code & other.code & EXACT_USER != 0 {
+                node.code < other.code
+            } else {
+                unpack(node.ptr) < unpack(other.ptr)
+            }
+        } {
             best[r] = i as u32;
         }
     }
@@ -1280,6 +1381,13 @@ impl P1 {
         }
     }
 
+    #[inline(never)]
+    fn route_batch(&mut self, rows: &[Raw], links: &LinkTable) {
+        for &r in rows {
+            self.route_event(r, Some(links));
+        }
+    }
+
     #[inline]
     fn retire(&self, destination: u32) {
         if destination != u32::MAX {
@@ -1321,7 +1429,7 @@ fn parse_click_fields<const BMI2: bool>(f: [&[u8]; 4], cx: &Ctx, dates: &mut Dat
     if cid.is_empty() || user.is_empty() {
         return None;
     }
-    let t = match parse_ts(ts, dates) {
+    let t = match parse_ts_vector::<BMI2>(ts, dates) {
         Some(t) if t >= cx.click_lo && t < cx.we => t,
         _ => return None,
     };
@@ -1512,7 +1620,7 @@ fn flush_user_rows(st: &mut W3, cx: &Ctx, out_dir: &str) {
             if r.ptr & EXACT_USER == 0 {
                 parquet_string(unpack(r.ptr))
             } else {
-                let end = start + 8 + usize::from((r.ptr >> 56) & 127 != 0);
+                let end = start + 8 + usize::from(r.ptr & 127 != 0);
                 let value = ByteArray::from(names.slice(start..end));
                 start = end;
                 value
@@ -1935,16 +2043,42 @@ fn sort_events(events: &mut [TimedEvent], ws: i64, compact: bool) {
     }
 }
 
+#[cold]
+fn grow_person_index(index: &mut Vec<u32>, groups: &[Group]) -> usize {
+    let cap = index.len() * 2;
+    let mask = cap - 1;
+    index.clear();
+    index.resize(cap, u32::MAX);
+    for (id, g) in groups.iter().enumerate() {
+        let mut j = (user_hash(g.key) as usize) & mask;
+        while index[j] != u32::MAX {
+            j = (j + 1) & mask;
+        }
+        index[j] = id as u32;
+    }
+    mask
+}
+
 fn phase3_bucket(b: usize, p1: &[P1], st: &mut W3, cx: &Ctx, out_dir: &str) {
     let evs = || p1.iter().flat_map(|w| w.live_events(b));
     let clicks = || p1.iter().flat_map(|w| &w.ck[b]);
     let n: usize = p1.iter().map(|w| w.count(b)).sum();
     if n == 0 { return; }
-    let cap = (2*n).next_power_of_two().max(16);
-    let mask = cap - 1;
+    // Size the initial table for people, not events. Dense histories
+    // make event count a poor estimate; the index grows for sparse ones.
+    let cap = (n / 4).next_power_of_two().max(16);
+    let mut mask = cap - 1;
     st.index.clear(); st.index.resize(cap, u32::MAX);
     st.groups.clear(); st.ev_ids.clear(); st.ck_ids.clear();
+    let mut last_key = 0;
+    let mut last_id = 0;
     for e in evs() {
+        // User codes are nonzero, so the first row never probes this cache.
+        if e.key == last_key && same_user(e.key, st.groups[last_id].ptr, e.ptr) {
+            st.groups[last_id].ec += 1;
+            st.ev_ids.push(last_id as u32);
+            continue;
+        }
         let mut j = (user_hash(e.key) as usize) & mask;
         loop {
             let gid = st.index[j];
@@ -1953,11 +2087,18 @@ fn phase3_bucket(b: usize, p1: &[P1], st: &mut W3, cx: &Ctx, out_dir: &str) {
                 st.groups.push(Group {key:e.key, ptr:e.ptr, ec:1, cc:0, es:0, cs:0});
                 st.index[j] = id;
                 st.ev_ids.push(id);
+                last_key = e.key;
+                last_id = id as usize;
+                if st.groups.len() * 4 >= (mask + 1) * 3 {
+                    mask = grow_person_index(&mut st.index, &st.groups);
+                }
                 break;
             }
             if st.groups[gid as usize].key == e.key && same_user(e.key, st.groups[gid as usize].ptr, e.ptr) {
                 st.groups[gid as usize].ec += 1;
                 st.ev_ids.push(gid);
+                last_key = e.key;
+                last_id = gid as usize;
                 break;
             }
             j = (j + 1) & mask;
@@ -2025,11 +2166,13 @@ fn main() {
     let nthreads = nthreads.max(1);
     #[cfg(target_arch = "x86_64")]
     let (avx512, avx2) = {
-        let bmi2 = std::arch::is_x86_feature_detected!("bmi2");
+        let vector = std::arch::is_x86_feature_detected!("bmi2")
+            && std::arch::is_x86_feature_detected!("ssse3")
+            && std::arch::is_x86_feature_detected!("sse4.1");
         let prefer_avx2 = std::env::var_os("PIPELINE_AVX2").is_some_and(|v| v == "1");
         (
-            bmi2 && !prefer_avx2 && std::arch::is_x86_feature_detected!("avx512bw"),
-            bmi2 && std::arch::is_x86_feature_detected!("avx2"),
+            vector && !prefer_avx2 && std::arch::is_x86_feature_detected!("avx512bw"),
+            vector && std::arch::is_x86_feature_detected!("avx2"),
         )
     };
 
@@ -2140,7 +2283,13 @@ fn main() {
                 #[cfg(target_arch = "x86_64")]
                 {
                     if avx512 {
-                        unsafe { parse_events_fast(data, a == 0, &cx, st, lt); }
+                        unsafe {
+                            if lt.is_some() {
+                                parse_events_fast::<true>(data, a == 0, &cx, st, lt);
+                            } else {
+                                parse_events_fast::<false>(data, a == 0, &cx, st, lt);
+                            }
+                        }
                         return;
                     }
                     if avx2 {
@@ -2291,6 +2440,53 @@ mod tests {
     #[cfg(target_arch = "x86_64")]
     use super::split_masks;
 
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn bmi2_quote_layout_matches_scalar() {
+        if !std::arch::is_x86_feature_detected!("bmi2") {
+            return;
+        }
+        let check = |line: &[u8]| {
+            let mut commas = 0u128;
+            let mut quotes = 0u128;
+            for (i, &b) in line.iter().enumerate() {
+                if b == b',' { commas |= 1 << i; }
+                if b == b'"' { quotes |= 1 << i; }
+            }
+            let got = unsafe { super::split_masks_bmi2::<7>(line, commas, quotes) };
+            assert_eq!(got, split_scalar::<7>(line), "{line:?}");
+        };
+        for prefix in 0..104 {
+            let line = format!("\"{}\",,a,\"\",b,\"word\",", "x".repeat(prefix));
+            check(line.as_bytes());
+            for i in 0..line.len() {
+                let mut malformed = line.as_bytes().to_vec();
+                malformed[i] = b'"';
+                check(&malformed);
+            }
+        }
+        check(format!("\"a\",,a,\"\",b,{},", "x".repeat(115)).as_bytes());
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn simd_decimal_matches_scalar() {
+        if !(std::arch::is_x86_feature_detected!("ssse3") && std::arch::is_x86_feature_detected!("sse4.1")) {
+            return;
+        }
+        let mut cache = DateCache::new();
+        for mut text in [*b"0000000000000", *b"1777401721000", *b"9999999999999"] {
+            for i in 0..text.len() {
+                let original = text[i];
+                for b in 0..=255 {
+                    text[i] = b;
+                    assert_eq!(super::parse_ts_vector::<true>(&text, &mut cache), parse_ts(&text, &mut cache));
+                }
+                text[i] = original;
+            }
+        }
+    }
+
     #[test]
     fn vector_csv_matches_scalar_across_block_boundaries() {
         for start in 0..132 {
@@ -2356,6 +2552,10 @@ mod tests {
         assert_ne!(code & EXACT_USER, 0);
         assert_ne!(code, user_code(&base[..8]));
         assert_eq!(short_name(user_code(&base[..8])), (*b"u91abcde", 0));
+        let names: [&[u8]; 5] = [b"U91abcde", b"u91abbzz", b"u91abcde", b"u91abcdef", b"u91abcdf"];
+        for pair in names.windows(2) {
+            assert!(pair[0] < pair[1] && user_code(pair[0]) < user_code(pair[1]));
+        }
         for i in 0..base.len() {
             let mut observed = std::collections::HashSet::new();
             let mut id = base;

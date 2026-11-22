@@ -10,19 +10,24 @@ repository.
 
 - Memory-map the CSVs, scan line-aligned chunks in parallel, and validate
   CSV syntax before deduplication. Select the AVX-512 or AVX2 event scanner
-  at runtime, and use AVX-512 for short click rows when available. Other
-  CPUs and exceptional rows use the portable parser.
+  at runtime, and use AVX-512 for short click rows when available. Vector
+  paths validate and convert 13-digit epoch timestamps in parallel.
+  Other CPUs and exceptional rows use the portable parser.
 - Build the linked-ID components while parsing. Only aliases need entries
-  in the lookup table. Short ASCII IDs use exact compact keys and a
-  worker-local cache; other IDs are compared by their full bytes.
+  in the lookup table. Short ASCII IDs use exact, byte-ordered compact
+  keys and a worker-local cache; other IDs are compared by their full bytes.
+  Once the lookup table is ready, the AVX-512 event scanner prefetches
+  alias entries as it parses small batches, then routes the batch.
 - Route event payloads directly to person shards. A separate compact index
   retains event IDs and ingestion-order information, so deduplication
   only marks losing copies and does not reroute payloads. Invalid
   candidates still participate, and hash collisions are checked by byte
   comparison.
 - Keep event timestamps and purchase metadata packed during grouping and
-  sorting, with a wide fallback for longer windows. A single event needs
-  no sort; for heavy histories with a bounded window, aggregate inside
+  sorting, with a wide fallback for longer windows. The grouping index
+  grows with the number of people rather than reserving space for every
+  event. A single event needs no sort; for heavy histories with a bounded
+  window, aggregate inside
   half-open 30-minute buckets and check the exact gap between nonempty
   buckets. A single session needs no click sort: scan once for last-touch
   attribution and distinct assisting campaigns. For longer histories,
