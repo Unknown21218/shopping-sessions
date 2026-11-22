@@ -1,5 +1,5 @@
 // Shopping Sessions pipeline: single-binary, multi-threaded, exact to rules.md.
-use memchr::{memchr, memchr_iter};
+use memchr::memchr;
 use memmap2::Mmap;
 use parquet::basic::Compression;
 use parquet::data_type::{ByteArray, ByteArrayType, Int32Type, Int64Type};
@@ -16,11 +16,11 @@ const DAY_MS: i64 = 86_400_000;
 const WEEK_MS: i64 = 7 * DAY_MS;
 const GAP_MS: i64 = 1_800_000;
 const LATE_MS: i64 = DAY_MS;
-const B1_SHIFT: u32 = 58; // 64 buckets by event-id hash
+const B1_SHIFT: u32 = 55; // 512 buckets by event-id hash
 const B1: usize = 1 << (64 - B1_SHIFT);
-const B2_SHIFT: u32 = 58; // 64 buckets by person-key hash
+const B2_SHIFT: u32 = 55; // 512 buckets by person-key hash
 const B2: usize = 1 << (64 - B2_SHIFT);
-const CHUNK: usize = 512 << 10; // 512 KB chunks for balanced multi-core scheduling
+const CHUNK: usize = 8 << 20;
 const NO_CAT: u16 = 0xFFFF;
 
 // ---------------------------------------------------------------- utilities
@@ -37,13 +37,24 @@ fn hash_bytes(b: &[u8]) -> u64 {
         p = &p[8..];
     }
     if !p.is_empty() {
-        let mut buf = [0u8; 8];
-        buf[..p.len()].copy_from_slice(p);
-        h = (h ^ u64::from_le_bytes(buf)).wrapping_mul(K);
+        let tail = if b.len() >= 8 {
+            // The last word contains the tail in its high bytes.
+            let word = u64::from_le_bytes(b[b.len() - 8..].try_into().unwrap());
+            word >> ((8 - p.len()) * 8)
+        } else {
+            let mut tail = 0u64;
+            for (i, &byte) in p.iter().enumerate() {
+                tail |= u64::from(byte) << (i * 8);
+            }
+            tail
+        };
+        h = (h ^ tail).wrapping_mul(K);
         h ^= h >> 32;
     }
     h ^= h >> 33;
     h = h.wrapping_mul(0xff51_afd7_ed55_8ccd);
+    h ^= h >> 33;
+    h = h.wrapping_mul(0xc4ce_b9fe_1a85_ec53);
     h ^= h >> 33;
     if h == 0 {
         1
@@ -54,12 +65,27 @@ fn hash_bytes(b: &[u8]) -> u64 {
 
 #[inline(always)]
 fn pack(s: &[u8]) -> u64 {
-    (s.as_ptr() as u64) | ((s.len() as u64) << 48)
+    // Reserve the largest length tag for a descriptor for longer strings.
+    // The slices all point into the mmaps retained for the life of the process.
+    if s.len() >= u16::MAX as usize {
+        let descriptor = Box::into_raw(Box::new((s.as_ptr(), s.len())));
+        (descriptor as u64) | ((u16::MAX as u64) << 48)
+    } else {
+        (s.as_ptr() as u64) | ((s.len() as u64) << 48)
+    }
 }
-
 #[inline(always)]
 fn unpack(p: u64) -> &'static [u8] {
-    unsafe { std::slice::from_raw_parts((p & 0xFFFF_FFFF_FFFF) as *const u8, (p >> 48) as usize) }
+    let ptr = p & 0xFFFF_FFFF_FFFF;
+    let len = (p >> 48) as usize;
+    unsafe {
+        if len == u16::MAX as usize {
+            let &(ptr, len) = &*(ptr as *const (*const u8, usize));
+            std::slice::from_raw_parts(ptr, len)
+        } else {
+            std::slice::from_raw_parts(ptr as *const u8, len)
+        }
+    }
 }
 
 #[inline(always)]
@@ -68,49 +94,116 @@ fn floor_div(a: i64, b: i64) -> i64 {
 }
 
 #[inline(always)]
-fn has_quote(f: &[u8]) -> bool {
-    if f.len() <= 24 {
-        f.iter().any(|&c| c == b'"')
-    } else {
-        memchr(b'"', f).is_some()
-    }
-}
-
-#[inline(always)]
-fn unq(f: &[u8]) -> Option<&[u8]> {
-    let n = f.len();
-    if n >= 2 && f[0] == b'"' && f[n - 1] == b'"' {
-        let inner = &f[1..n - 1];
-        if has_quote(inner) {
-            None
-        } else {
-            Some(inner)
+fn split_scalar<const N: usize>(line: &[u8]) -> Option<[&[u8]; N]> {
+    let mut out: [&[u8]; N] = [&[]; N];
+    let mut pos = 0;
+    for (i, field) in out.iter_mut().enumerate() {
+        let quoted = line.get(pos) == Some(&b'"');
+        pos += quoted as usize;
+        let start = pos;
+        while pos < line.len() && line[pos] != b',' && line[pos] != b'"' {
+            pos += 1;
         }
-    } else if has_quote(f) {
-        None
-    } else {
-        Some(f)
+        *field = &line[start..pos];
+        if quoted {
+            if line.get(pos) != Some(&b'"') {
+                return None;
+            }
+            pos += 1;
+        }
+        if i + 1 < N {
+            if line.get(pos) != Some(&b',') {
+                return None;
+            }
+            pos += 1;
+        } else if pos != line.len() {
+            return None;
+        }
     }
+    Some(out)
 }
 
 #[inline(always)]
 fn split<const N: usize>(line: &[u8]) -> Option<[&[u8]; N]> {
-    let mut out: [&[u8]; N] = [&[]; N];
-    let mut start = 0;
-    let mut k = 0;
-    for pos in memchr_iter(b',', line) {
-        if k >= N - 1 {
-            return None;
+    #[cfg(target_arch = "x86_64")]
+    if (32..=128).contains(&line.len()) {
+        // Both vector parsers load only bytes within the slice.
+        if std::arch::is_x86_feature_detected!("avx512bw") {
+            return unsafe { split_avx512(line) };
         }
-        out[k] = &line[start..pos];
-        k += 1;
-        start = pos + 1;
+        if std::arch::is_x86_feature_detected!("avx2") {
+            return unsafe { split_avx2(line) };
+        }
     }
-    if k != N - 1 {
+    split_scalar(line)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn split_avx2<const N: usize>(line: &[u8]) -> Option<[&[u8]; N]> {
+    use std::arch::x86_64::*;
+
+    let comma = _mm256_set1_epi8(b',' as i8);
+    let quote = _mm256_set1_epi8(b'"' as i8);
+    let mut commas = 0u128;
+    let mut quotes = 0u128;
+    // The final vector overlaps the preceding block for a partial tail.
+    // OR-ing the masks counts each byte only once.
+    let mut offset = 0;
+    loop {
+        let v = _mm256_loadu_si256(line.as_ptr().add(offset).cast());
+        commas |= (u128::from(_mm256_movemask_epi8(_mm256_cmpeq_epi8(v, comma)) as u32)) << offset;
+        quotes |= (u128::from(_mm256_movemask_epi8(_mm256_cmpeq_epi8(v, quote)) as u32)) << offset;
+        if offset + 32 == line.len() {
+            break;
+        }
+        offset = (offset + 32).min(line.len() - 32);
+    }
+    split_masks(line, commas, quotes)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512bw")]
+unsafe fn split_avx512<const N: usize>(line: &[u8]) -> Option<[&[u8]; N]> {
+    use std::arch::x86_64::*;
+
+    let comma = _mm512_set1_epi8(b',' as i8);
+    let quote = _mm512_set1_epi8(b'"' as i8);
+    let ptr = line.as_ptr();
+    let low_mask = u64::MAX >> 64usize.saturating_sub(line.len());
+    let lo = _mm512_maskz_loadu_epi8(low_mask, ptr.cast());
+    let mut commas = u128::from(_mm512_cmpeq_epi8_mask(lo, comma));
+    let mut quotes = u128::from(_mm512_cmpeq_epi8_mask(lo, quote));
+    if line.len() > 64 {
+        let high_mask = u64::MAX >> (128 - line.len());
+        let hi = _mm512_maskz_loadu_epi8(high_mask, ptr.add(64).cast());
+        commas |= u128::from(_mm512_cmpeq_epi8_mask(hi, comma)) << 64;
+        quotes |= u128::from(_mm512_cmpeq_epi8_mask(hi, quote)) << 64;
+    }
+    split_masks(line, commas, quotes)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+fn split_masks<const N: usize>(line: &[u8], mut commas: u128, quotes: u128) -> Option<[&[u8]; N]> {
+    if commas.count_ones() as usize != N - 1 {
         return None;
     }
-    out[k] = &line[start..];
-    Some(out)
+    let mut out = [&[][..]; N];
+    let mut start = 0;
+    let mut expected_quotes = 0u128;
+    for (i, field) in out.iter_mut().enumerate() {
+        let end = if i + 1 == N { line.len() } else { commas.trailing_zeros() as usize };
+        commas &= commas.wrapping_sub(1);
+        if end >= start + 2 && line[start] == b'"' {
+            expected_quotes |= (1u128 << start) | (1u128 << (end - 1));
+            *field = &line[start + 1..end - 1];
+        } else {
+            *field = &line[start..end];
+        }
+        start = end + 1;
+    }
+    (quotes == expected_quotes).then_some(out)
 }
 
 fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
@@ -132,21 +225,17 @@ fn d2(f: &[u8], i: usize) -> Option<i64> {
     }
 }
 
-#[derive(Clone, Copy)]
-struct IsoDateCache {
-    date_bytes: [u8; 10],
-    day_ms: i64,
-    valid: bool,
-}
+// A small worker-local cache avoids repeating calendar arithmetic. The
+// full date is compared on a hit, so arbitrary dates can share a slot.
+struct DateCache([([u8; 10], i64); 32]);
 
-impl Default for IsoDateCache {
-    fn default() -> Self {
-        Self { date_bytes: [0; 10], day_ms: 0, valid: false }
+impl DateCache {
+    fn new() -> Self {
+        Self([(*b"1970-01-01", 0); 32])
     }
 }
 
-#[inline(always)]
-fn parse_iso_cached(f: &[u8], cache: &mut IsoDateCache) -> Option<i64> {
+fn parse_iso(f: &[u8], cache: &mut DateCache) -> Option<i64> {
     let n = f.len();
     if n != 20 && n != 25 {
         return None;
@@ -154,8 +243,16 @@ fn parse_iso_cached(f: &[u8], cache: &mut IsoDateCache) -> Option<i64> {
     if f[10] != b'T' || f[13] != b':' || f[16] != b':' {
         return None;
     }
-    let day_ms = if cache.valid && f[..10] == cache.date_bytes {
-        cache.day_ms
+    let h = d2(f, 11)?;
+    let mi = d2(f, 14)?;
+    let s = d2(f, 17)?;
+    if h > 23 || mi > 59 || s > 59 {
+        return None;
+    }
+    let slot = ((f[8] as usize) * 10 + f[9] as usize) & 31;
+    let entry = &mut cache.0[slot];
+    let day_ms = if f[..10] == entry.0 {
+        entry.1
     } else {
         if f[4] != b'-' || f[7] != b'-' {
             return None;
@@ -170,30 +267,16 @@ fn parse_iso_cached(f: &[u8], cache: &mut IsoDateCache) -> Option<i64> {
         let ml = match mo {
             1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
             4 | 6 | 9 | 11 => 30,
-            _ => {
-                if leap {
-                    29
-                } else {
-                    28
-                }
-            }
+            _ => 28 + i64::from(leap),
         };
         if d > ml {
             return None;
         }
-        let dm = days_from_civil(y, mo, d) * 86_400_000;
-        cache.date_bytes.copy_from_slice(&f[..10]);
-        cache.day_ms = dm;
-        cache.valid = true;
-        dm
+        let value = days_from_civil(y, mo, d) * DAY_MS;
+        entry.0.copy_from_slice(&f[..10]);
+        entry.1 = value;
+        value
     };
-
-    let h = d2(f, 11)?;
-    let mi = d2(f, 14)?;
-    let s = d2(f, 17)?;
-    if h > 23 || mi > 59 || s > 59 {
-        return None;
-    }
     let off: i64 = if n == 20 {
         if f[19] != b'Z' {
             return None;
@@ -219,44 +302,37 @@ fn parse_iso_cached(f: &[u8], cache: &mut IsoDateCache) -> Option<i64> {
 }
 
 #[inline(always)]
-fn parse_ts(f: &[u8], cache: &mut IsoDateCache) -> Option<i64> {
-    let n = f.len();
-    if n == 0 {
+fn parse_ts(mut f: &[u8], cache: &mut DateCache) -> Option<i64> {
+    if f.is_empty() {
         return None;
     }
-    if n == 20 || n == 25 {
-        if f[10] == b'T' {
-            return parse_iso_cached(f, cache);
-        }
+    if matches!(f.len(), 20 | 25) && f[10] == b'T' {
+        return parse_iso(f, cache);
     }
-    if f.iter().all(|c| c.is_ascii_digit()) {
-        let mut i = 0;
-        while i < n && f[i] == b'0' {
-            i += 1;
-        }
-        let g = &f[i..];
-        if g.len() > 18 {
+    while f.len() > 18 && f.first() == Some(&b'0') {
+        f = &f[1..];
+    }
+    if f.len() > 18 {
+        return None;
+    }
+    let mut v = 0i64;
+    for &c in f {
+        let digit = c.wrapping_sub(b'0');
+        if digit > 9 {
             return None;
         }
-        let mut v: i64 = 0;
-        for &c in g {
-            v = v * 10 + (c - b'0') as i64;
-        }
-        return Some(v);
+        v = v * 10 + i64::from(digit);
     }
-    parse_iso_cached(f, cache)
+    Some(v)
 }
 
 #[inline(always)]
 fn parse_price(f: &[u8]) -> Option<u32> {
-    if f.is_empty() {
+    if f.is_empty() || !f.iter().all(|c| c.is_ascii_digit()) {
         return None;
     }
     let mut v: u64 = 0;
     for &c in f {
-        if !c.is_ascii_digit() {
-            return None;
-        }
         v = v * 10 + (c - b'0') as u64;
         if v > 10_000_000 {
             return None;
@@ -281,26 +357,11 @@ fn json_str(text: &str, key: &str) -> String {
 
 // ---------------------------------------------------------------- threads
 
-fn par_run<S: Send, M, F>(nthreads: usize, ntasks: usize, order: Option<&[usize]>, mk: M, f: F) -> Vec<S>
+fn par_run<S: Send, M, F, D>(nthreads: usize, ntasks: usize, order: Option<&[usize]>, mk: M, f: F, done: D) -> Vec<S>
 where
     M: Fn(usize) -> S + Sync,
     F: Fn(&mut S, usize) + Sync,
-{
-    par_run_fin(nthreads, ntasks, order, mk, f, |_| {})
-}
-
-fn par_run_fin<S: Send, M, F, E>(
-    nthreads: usize,
-    ntasks: usize,
-    order: Option<&[usize]>,
-    mk: M,
-    f: F,
-    fin: E,
-) -> Vec<S>
-where
-    M: Fn(usize) -> S + Sync,
-    F: Fn(&mut S, usize) + Sync,
-    E: Fn(&mut S) + Sync,
+    D: Fn(&mut S) + Sync,
 {
     let next = AtomicUsize::new(0);
     thread::scope(|sc| {
@@ -309,7 +370,7 @@ where
                 let next = &next;
                 let f = &f;
                 let mk = &mk;
-                let fin = &fin;
+                let done = &done;
                 sc.spawn(move || {
                     let mut s = mk(t);
                     loop {
@@ -323,24 +384,13 @@ where
                         };
                         f(&mut s, task);
                     }
-                    fin(&mut s);
+                    done(&mut s);
                     s
                 })
             })
             .collect();
         hs.into_iter().map(|h| h.join().unwrap()).collect()
     })
-}
-
-fn par_drop<T: Send>(mut items: Vec<T>) {
-    if items.is_empty() {
-        return;
-    }
-    thread::scope(|sc| {
-        for item in items.drain(..) {
-            sc.spawn(move || drop(item));
-        }
-    });
 }
 
 // ---------------------------------------------------------------- files
@@ -465,7 +515,7 @@ struct Ctx {
     camp: SmallMap, // campaign hash -> idx
     camp_ids: Vec<Vec<u8>>,
     camp_ch: Vec<Vec<u8>>,
-    cat_ba: Vec<ByteArray>, // pre-built ByteArrays by rank (zero-alloc clone)
+    cat_names: Vec<Vec<u8>>, // by rank
 }
 
 fn read_table(path: &str) -> Vec<Vec<Vec<u8>>> {
@@ -473,9 +523,7 @@ fn read_table(path: &str) -> Vec<Vec<Vec<u8>>> {
     let mut rows = vec![];
     for_lines(d, true, |l| {
         if let Some(f) = split::<2>(l) {
-            if let (Some(a), Some(b)) = (unq(f[0]), unq(f[1])) {
-                rows.push(vec![a.to_vec(), b.to_vec()]);
-            }
+            rows.push(vec![f[0].to_vec(), f[1].to_vec()]);
         }
     });
     rows
@@ -516,34 +564,17 @@ struct Ck {
 }
 
 #[inline(always)]
-fn parse_event(line: &[u8], cx: &Ctx, cache: &mut IsoDateCache) -> Option<Raw> {
+fn parse_event(line: &[u8], cx: &Ctx, dates: &mut DateCache) -> Option<Raw> {
     let f = split::<7>(line)?;
-    let eid = unq(f[0])?;
-    let user = unq(f[1])?;
-    let ts = unq(f[2])?;
-    let ing = unq(f[3])?;
-    let ty = unq(f[4])?;
-    let prod = unq(f[5])?;
-    let price = unq(f[6])?;
+    let [eid, user, ts, ing, ty, prod, price] = f;
     if eid.is_empty() {
         return None;
     }
-    let ingest = match parse_ts(ing, cache) {
+    let ingest = match parse_ts(ing, dates) {
         Some(v) => v,
         None => i64::MAX,
     };
-    let mut r = Raw {
-        eid: hash_bytes(eid),
-        eptr: pack(eid),
-        ingest,
-        uh: 0,
-        uptr: 0,
-        ts: 0,
-        price: 0,
-        cat: 0,
-        flags: 0,
-        _p: 0,
-    };
+    let mut r = Raw { eid: hash_bytes(eid), eptr: pack(eid), ingest, uh: 0, uptr: 0, ts: 0, price: 0, cat: 0, flags: 0, _p: 0 };
     if user.is_empty() || prod.is_empty() || ingest == i64::MAX {
         return Some(r);
     }
@@ -552,7 +583,7 @@ fn parse_event(line: &[u8], cx: &Ctx, cache: &mut IsoDateCache) -> Option<Raw> {
         b"purchase" => 3,
         _ => return Some(r),
     };
-    let t = match parse_ts(ts, cache) {
+    let t = match parse_ts(ts, dates) {
         Some(t) if t >= cx.ws && t < cx.we => t,
         _ => return Some(r),
     };
@@ -607,7 +638,6 @@ impl LinkTable {
     }
 }
 
-#[inline(always)]
 fn find(parent: &mut [u32], mut x: u32) -> u32 {
     while parent[x as usize] != x {
         let p = parent[x as usize];
@@ -617,74 +647,55 @@ fn find(parent: &mut [u32], mut x: u32) -> u32 {
     x
 }
 
-fn build_links(files: &[&'static [u8]], nthreads: usize) -> LinkTable {
-    let chunks = make_chunks(files);
-    if chunks.is_empty() {
-        return LinkTable { slots: vec![Slot::default()], mask: 0 };
-    }
-    let per_thread_pairs: Vec<Vec<(u64, u64, u64, u64)>> = par_run(
-        nthreads.min(chunks.len()).max(1),
-        chunks.len(),
-        None,
-        |_| Vec::new(),
-        |pairs, ti| {
-            let (fi, a, b) = chunks[ti];
-            for_lines(&files[fi][a..b], a == 0, |l| {
-                if let Some(f) = split::<2>(l) {
-                    if let (Some(a), Some(b)) = (unq(f[0]), unq(f[1])) {
-                        if !a.is_empty() && !b.is_empty() {
-                            pairs.push((hash_bytes(a), pack(a), hash_bytes(b), pack(b)));
-                        }
-                    }
+fn build_links(files: &[&'static [u8]]) -> LinkTable {
+    let mut pairs: Vec<(u64, u64, u64, u64)> = vec![];
+    for d in files {
+        for_lines(d, true, |l| {
+            if let Some(f) = split::<2>(l) {
+                let [a, b] = f;
+                if !a.is_empty() && !b.is_empty() {
+                    pairs.push((hash_bytes(a), pack(a), hash_bytes(b), pack(b)));
                 }
-            });
-        },
-    );
-
-    let total_pairs: usize = per_thread_pairs.iter().map(|v| v.len()).sum();
-    if total_pairs == 0 {
+            }
+        });
+    }
+    if pairs.is_empty() {
         return LinkTable { slots: vec![Slot::default()], mask: 0 };
     }
-
-    let cap = (total_pairs * 4 + 2).next_power_of_two().max(16);
+    let cap = (pairs.len() * 4 + 2).next_power_of_two().max(16);
     let mask = cap - 1;
     let mut slots = vec![Slot::default(); cap];
     let mut node_of_slot = vec![0u32; cap];
-    let mut parent: Vec<u32> = Vec::with_capacity(total_pairs * 2);
-    let mut nptr: Vec<u64> = Vec::with_capacity(total_pairs * 2);
-    let mut nhash: Vec<u64> = Vec::with_capacity(total_pairs * 2);
-    let mut edges: Vec<(u32, u32)> = Vec::with_capacity(total_pairs);
-
-    for pairs in &per_thread_pairs {
-        for &(ha, pa, hb, pb) in pairs {
-            let mut ids = [0u32; 2];
-            for (k, (h, p)) in [(ha, pa), (hb, pb)].into_iter().enumerate() {
-                let raw_bytes = unpack(p);
-                let mut i = (h as usize) & mask;
-                loop {
-                    if slots[i].key == h && unpack(slots[i].kptr) == raw_bytes {
-                        ids[k] = node_of_slot[i];
-                        break;
-                    }
-                    if slots[i].key == 0 {
-                        slots[i].key = h;
-                        slots[i].kptr = p;
-                        let n = parent.len() as u32;
-                        node_of_slot[i] = n;
-                        parent.push(n);
-                        nptr.push(p);
-                        nhash.push(h);
-                        ids[k] = n;
-                        break;
-                    }
-                    i = (i + 1) & mask;
+    let mut parent: Vec<u32> = Vec::with_capacity(pairs.len() * 2);
+    let mut nptr: Vec<u64> = Vec::with_capacity(pairs.len() * 2);
+    let mut nhash: Vec<u64> = Vec::with_capacity(pairs.len() * 2);
+    let mut edges: Vec<(u32, u32)> = Vec::with_capacity(pairs.len());
+    for &(ha, pa, hb, pb) in &pairs {
+        let mut ids = [0u32; 2];
+        for (k, (h, p)) in [(ha, pa), (hb, pb)].into_iter().enumerate() {
+            let mut i = (h as usize) & mask;
+            loop {
+                if slots[i].key == h && unpack(slots[i].kptr) == unpack(p) {
+                    ids[k] = node_of_slot[i];
+                    break;
                 }
+                if slots[i].key == 0 {
+                    slots[i].key = h;
+                    slots[i].kptr = p;
+                    let n = parent.len() as u32;
+                    node_of_slot[i] = n;
+                    parent.push(n);
+                    nptr.push(p);
+                    nhash.push(h);
+                    ids[k] = n;
+                    break;
+                }
+                i = (i + 1) & mask;
             }
-            edges.push((ids[0], ids[1]));
         }
+        edges.push((ids[0], ids[1]));
     }
-    drop(per_thread_pairs);
-
+    drop(pairs);
     for &(a, b) in &edges {
         let ra = find(&mut parent, a);
         let rb = find(&mut parent, b);
@@ -720,28 +731,24 @@ fn build_links(files: &[&'static [u8]], nthreads: usize) -> LinkTable {
 // ---------------------------------------------------------------- phase states
 
 struct P1 {
+    dates: DateCache,
     buckets: Vec<Vec<Raw>>,
-    cache: IsoDateCache,
 }
 struct P2 {
+    dates: DateCache,
+    recs: Vec<Raw>,
+    slots: Vec<u32>,
     ev: Vec<Vec<Ev>>,
     ck: Vec<Vec<Ck>>,
-    recs_scratch: Vec<Raw>,
-    tab_scratch: Vec<u32>,
-    cache: IsoDateCache,
 }
 
-#[inline(always)]
-fn parse_click(line: &[u8], cx: &Ctx, links: &LinkTable, cache: &mut IsoDateCache) -> Option<Ck> {
+fn parse_click(line: &[u8], cx: &Ctx, links: &LinkTable, dates: &mut DateCache) -> Option<Ck> {
     let f = split::<4>(line)?;
-    let cid = unq(f[0])?;
-    let user = unq(f[1])?;
-    let camp = unq(f[2])?;
-    let ts = unq(f[3])?;
+    let [cid, user, camp, ts] = f;
     if cid.is_empty() || user.is_empty() {
         return None;
     }
-    let t = match parse_ts(ts, cache) {
+    let t = match parse_ts(ts, dates) {
         Some(t) if t >= cx.click_lo && t < cx.we => t,
         _ => return None,
     };
@@ -759,38 +766,44 @@ fn dedup_bucket(b: usize, p1: &[P1], links: &LinkTable, st: &mut P2) {
     if n == 0 {
         return;
     }
-    st.recs_scratch.clear();
-    st.recs_scratch.reserve(n);
+    let recs = &mut st.recs;
+    recs.clear();
+    recs.reserve(n);
     for w in p1 {
-        st.recs_scratch.extend_from_slice(&w.buckets[b]);
+        recs.extend_from_slice(&w.buckets[b]);
     }
     let cap = (2 * n).next_power_of_two().max(16);
     let mask = cap - 1;
-    st.tab_scratch.clear();
-    st.tab_scratch.resize(cap, u32::MAX);
+    let tab = &mut st.slots;
+    tab.clear();
+    tab.resize(cap, 0);
 
-    let recs = &mut st.recs_scratch;
-    let tab = &mut st.tab_scratch;
-
+    // Keep a short hash tag beside each record index. Most occupied
+    // slots have a different tag, so probing does not touch the record.
+    let index_bits = u32::try_from(n).expect("dedup bucket too large");
+    let index_mask = u32::MAX >> index_bits.leading_zeros();
     for i in 0..n {
         let e = recs[i].eid;
-        let eb = unpack(recs[i].eptr);
+        let tag = ((e >> 32) as u32) & !index_mask;
+        let slot_value = tag | (i as u32 + 1);
         let mut s = (e as usize) & mask;
         loop {
-            let j = unsafe { *tab.get_unchecked(s) };
-            if j == u32::MAX {
-                unsafe { *tab.get_unchecked_mut(s) = i as u32 };
+            let j = tab[s];
+            if j == 0 {
+                tab[s] = slot_value;
                 break;
             }
-            let ju = j as usize;
-            if recs[ju].eid == e && unpack(recs[ju].eptr) == eb {
-                if recs[i].ingest < recs[ju].ingest {
-                    recs[ju].flags = 0;
-                    unsafe { *tab.get_unchecked_mut(s) = i as u32 };
-                } else {
-                    recs[i].flags = 0;
+            if j & !index_mask == tag {
+                let ju = ((j & index_mask) - 1) as usize;
+                if recs[ju].eid == e && unpack(recs[ju].eptr) == unpack(recs[i].eptr) {
+                    if recs[i].ingest < recs[ju].ingest {
+                        recs[ju].flags = 0;
+                        tab[s] = slot_value;
+                    } else {
+                        recs[i].flags = 0;
+                    }
+                    break;
                 }
-                break;
             }
             s = (s + 1) & mask;
         }
@@ -904,14 +917,14 @@ fn flush_user_rows(st: &mut W3, cx: &Ctx, out_dir: &str) {
     }
     {
         let mut c = rg.next_column().unwrap().unwrap();
-        let mut vals: Vec<ByteArray> = Vec::with_capacity(st.rows.len());
+        let mut vals: Vec<ByteArray> = Vec::new();
         let mut defs: Vec<i16> = Vec::with_capacity(st.rows.len());
         for r in &st.rows {
             if r.top == NO_CAT {
                 defs.push(0);
             } else {
                 defs.push(1);
-                vals.push(cx.cat_ba[r.top as usize].clone());
+                vals.push(ByteArray::from(cx.cat_names[r.top as usize].clone()));
             }
         }
         c.typed::<ByteArrayType>().write_batch(&vals, Some(&defs), None).unwrap();
@@ -1052,7 +1065,6 @@ fn add_assist(st: &mut W3, cx: &Ctx, camp: usize, a: usize, b: usize) {
     }
 }
 
-#[inline(always)]
 fn top_cat(c: &[(u16, i64)]) -> u16 {
     let mut best = NO_CAT;
     let mut bs = i64::MIN;
@@ -1105,7 +1117,7 @@ fn phase3_bucket(b: usize, p2: &[P2], st: &mut W3, cx: &Ctx, out_dir: &str) {
     }
     st.evbuf = evbuf;
     st.ckbuf = ckbuf;
-    if st.rows.len() >= 100_000 {
+    if st.rows.len() >= 200_000 {
         flush_user_rows(st, cx, out_dir);
     }
 }
@@ -1122,9 +1134,9 @@ fn main() {
     let nthreads = nthreads.max(1);
 
     let manifest = std::fs::read_to_string(format!("{}/manifest.json", data)).expect("manifest");
-    let mut ts_cache = IsoDateCache::default();
-    let ws = parse_ts(json_str(&manifest, "window_start").as_bytes(), &mut ts_cache).expect("window_start");
-    let we = parse_ts(json_str(&manifest, "window_end").as_bytes(), &mut ts_cache).expect("window_end");
+    let mut dates = DateCache::new();
+    let ws = parse_ts(json_str(&manifest, "window_start").as_bytes(), &mut dates).expect("window_start");
+    let we = parse_ts(json_str(&manifest, "window_end").as_bytes(), &mut dates).expect("window_end");
 
     // products, campaigns
     let prows = read_table(&format!("{}/products.csv", data));
@@ -1141,8 +1153,6 @@ fn main() {
         prod.insert(hash_bytes(&r[0]), rank_of(&r[1]));
     }
     let unknown_rank = rank_of(b"unknown") as u16;
-    let cat_ba: Vec<ByteArray> = cats.iter().map(|c| ByteArray::from(c.clone())).collect();
-
     let crows = read_table(&format!("{}/campaigns.csv", data));
     let mut camp = SmallMap::new(crows.len());
     let mut camp_ids = vec![];
@@ -1169,7 +1179,7 @@ fn main() {
         camp,
         camp_ids,
         camp_ch,
-        cat_ba,
+        cat_names: cats.clone(),
     };
 
     let ev_files = load_dir(&format!("{}/events", data));
@@ -1181,25 +1191,26 @@ fn main() {
     std::fs::create_dir_all(format!("{}/user_daily", out)).unwrap();
     std::fs::create_dir_all(format!("{}/campaign_daily", out)).unwrap();
 
-    // phase 1: parse events + parallel union-find over links
-    let links = build_links(&ln_files, nthreads);
-    let p1: Vec<P1> = par_run(
-        nthreads,
-        ev_chunks.len(),
-        None,
-        |_| P1 {
-            buckets: (0..B1).map(|_| Vec::new()).collect(),
-            cache: IsoDateCache::default(),
-        },
-        |st, ti| {
-            let (fi, a, b) = ev_chunks[ti];
-            for_lines(&ev_files[fi][a..b], a == 0, |l| {
-                if let Some(r) = parse_event(l, &cx, &mut st.cache) {
-                    st.buckets[(r.eid >> B1_SHIFT) as usize].push(r);
-                }
-            });
-        },
-    );
+    // phase 1: parse events (+ links in a side thread)
+    let (links, p1): (LinkTable, Vec<P1>) = thread::scope(|sc| {
+        let lh = sc.spawn(|| build_links(&ln_files));
+        let p1 = par_run(
+            nthreads,
+            ev_chunks.len(),
+            None,
+            |_| P1 { dates: DateCache::new(), buckets: (0..B1).map(|_| Vec::new()).collect() },
+            |st, ti| {
+                let (fi, a, b) = ev_chunks[ti];
+                for_lines(&ev_files[fi][a..b], a == 0, |l| {
+                    if let Some(r) = parse_event(l, &cx, &mut st.dates) {
+                        st.buckets[(r.eid >> B1_SHIFT) as usize].push(r);
+                    }
+                });
+            },
+            |_| {},
+        );
+        (lh.join().unwrap(), p1)
+    });
 
     // phase 2: clicks + dedup buckets
     let nck = ck_chunks.len();
@@ -1207,18 +1218,12 @@ fn main() {
         nthreads,
         nck + B1,
         None,
-        |_| P2 {
-            ev: (0..B2).map(|_| Vec::new()).collect(),
-            ck: (0..B2).map(|_| Vec::new()).collect(),
-            recs_scratch: Vec::new(),
-            tab_scratch: Vec::new(),
-            cache: IsoDateCache::default(),
-        },
+        |_| P2 { dates: DateCache::new(), recs: Vec::new(), slots: Vec::new(), ev: (0..B2).map(|_| Vec::new()).collect(), ck: (0..B2).map(|_| Vec::new()).collect() },
         |st, ti| {
             if ti < nck {
                 let (fi, a, b) = ck_chunks[ti];
                 for_lines(&ck_files[fi][a..b], a == 0, |l| {
-                    if let Some(c) = parse_click(l, &cx, &links, &mut st.cache) {
+                    if let Some(c) = parse_click(l, &cx, &links, &mut st.dates) {
                         st.ck[(c.key >> B2_SHIFT) as usize].push(c);
                     }
                 });
@@ -1226,16 +1231,17 @@ fn main() {
                 dedup_bucket(ti - nck, &p1, &links, st);
             }
         },
+        |_| {},
     );
-    par_drop(p1);
+    drop(p1);
     drop(links);
 
-    // phase 3: sessions, attribution, parallel Parquet output
+    // phase 3: sessions, attribution, output
     let mut sizes: Vec<(usize, usize)> = (0..B2).map(|b| (p2.iter().map(|w| w.ev[b].len()).sum::<usize>(), b)).collect();
     sizes.sort_by(|a, b| b.0.cmp(&a.0));
     let order: Vec<usize> = sizes.iter().map(|x| x.1).collect();
     let nc1 = cx.camp_ids.len() + 1;
-    let w3s: Vec<W3> = par_run_fin(
+    let w3s: Vec<W3> = par_run(
         nthreads,
         B2,
         Some(&order),
@@ -1260,7 +1266,7 @@ fn main() {
             }
         },
     );
-    par_drop(p2);
+    drop(p2);
 
     let mut total = vec![[0i64; 4]; nc1 * ndays];
     let mut nfiles = 0;
@@ -1321,4 +1327,65 @@ fn main() {
         rg.close().unwrap();
     }
     wr.close().unwrap();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{pack, split, split_scalar, unpack};
+
+    #[test]
+    fn vector_csv_matches_scalar_across_block_boundaries() {
+        for start in 0..132 {
+            for len in [0, 1, 7, 25, 31, 32, 33] {
+                let line = format!("{} ,\"{}\",,tail", "a".repeat(start), "b".repeat(len));
+                assert_eq!(split::<4>(line.as_bytes()), split_scalar::<4>(line.as_bytes()));
+                for pos in [0, start + 1, start + 2 + len, line.len() - 1] {
+                    let mut malformed = line.as_bytes().to_vec();
+                    malformed[pos] = b'"';
+                    assert_eq!(split::<4>(&malformed), split_scalar::<4>(&malformed));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn packed_strings_preserve_long_lengths() {
+        for len in [0, 1, 65_534, 65_535, 65_536] {
+            let value = vec![b'a'; len];
+            assert_eq!(unpack(pack(&value)), value);
+        }
+    }
+
+    // A deliberately simple reference for the CSV dialect in rules.md.
+    fn reference(line: &[u8], count: usize) -> Option<Vec<&[u8]>> {
+        let fields: Vec<_> = line.split(|&b| b == b',').collect();
+        if fields.len() != count {
+            return None;
+        }
+        fields.into_iter().map(|field| {
+            if field.first() == Some(&b'"') && field.last() == Some(&b'"') && field.len() >= 2 {
+                let inner = &field[1..field.len() - 1];
+                (!inner.contains(&b'"')).then_some(inner)
+            } else {
+                (!field.contains(&b'"')).then_some(field)
+            }
+        }).collect()
+    }
+
+    #[test]
+    fn split_matches_csv_dialect_on_short_lines() {
+        const ALPHABET: &[u8] = b"a,\"\r";
+        for len in 0..=7 {
+            for mut code in 0..ALPHABET.len().pow(len) {
+                let mut line = vec![0; len as usize];
+                for byte in &mut line {
+                    *byte = ALPHABET[code % ALPHABET.len()];
+                    code /= ALPHABET.len();
+                }
+                assert_eq!(split::<2>(&line).map(|v| v.to_vec()), reference(&line, 2), "{line:?}");
+                assert_eq!(split::<4>(&line).map(|v| v.to_vec()), reference(&line, 4), "{line:?}");
+                assert_eq!(split::<7>(&line).map(|v| v.to_vec()), reference(&line, 7), "{line:?}");
+            }
+        }
+    }
 }
