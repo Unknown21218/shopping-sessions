@@ -8,7 +8,10 @@ use parquet::file::writer::SerializedFileWriter;
 use parquet::schema::parser::parse_message_type;
 use std::fs::File;
 use std::io::BufWriter;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, AtomicU64, Ordering};
+static COLLECT_NS: AtomicU64 = AtomicU64::new(0);
+static INDEX_NS: AtomicU64 = AtomicU64::new(0);
+static RESOLVE_NS: AtomicU64 = AtomicU64::new(0);
 use std::sync::Arc;
 use std::thread;
 
@@ -465,6 +468,44 @@ fn for_lines(data: &[u8], first: bool, mut f: impl FnMut(&[u8])) {
     }
 }
 
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512bw")]
+unsafe fn parse_events_fast(data: &[u8], first: bool, cx: &Ctx, st: &mut P1) {
+    use std::arch::x86_64::*;
+    let mut pos = if first { memchr(b'\n', data).map_or(data.len(), |i| i + 1) } else { 0 };
+    let comma = _mm512_set1_epi8(b',' as i8);
+    let quote = _mm512_set1_epi8(b'"' as i8);
+    let newline = _mm512_set1_epi8(b'\n' as i8);
+    while pos < data.len() {
+        let available = data.len() - pos;
+        let m = u64::MAX >> (64usize.saturating_sub(available));
+        let v = _mm512_maskz_loadu_epi8(m, data.as_ptr().add(pos).cast());
+        let newlines = _mm512_cmpeq_epi8_mask(v, newline);
+        let mut commas = u128::from(_mm512_cmpeq_epi8_mask(v, comma));
+        let mut quotes = u128::from(_mm512_cmpeq_epi8_mask(v, quote));
+        let mut len = if newlines != 0 { newlines.trailing_zeros() as usize } else { available.min(64) };
+        if len == 64 && available > 64 {
+            let m = u64::MAX >> (128usize.saturating_sub(available));
+            let v = _mm512_maskz_loadu_epi8(m, data.as_ptr().add(pos + 64).cast());
+            let newlines = _mm512_cmpeq_epi8_mask(v, newline);
+            commas |= u128::from(_mm512_cmpeq_epi8_mask(v, comma)) << 64;
+            quotes |= u128::from(_mm512_cmpeq_epi8_mask(v, quote)) << 64;
+            len = if newlines != 0 { 64 + newlines.trailing_zeros() as usize } else { available.min(128) };
+        }
+        if len == 128 && available > 128 {
+            let end = memchr(b'\n', &data[pos..]).map_or(data.len(), |i| pos + i);
+            if let Some(r) = parse_event(&data[pos..end], cx, &mut st.dates) { st.buckets[(r.eid >> B1_SHIFT) as usize].push(r); }
+            pos = end + 1;
+        } else {
+            let mask = if len == 128 { u128::MAX } else { (1u128 << len) - 1 };
+            if let Some(f) = split_masks::<7>(&data[pos..pos + len], commas & mask, quotes & mask) {
+                if let Some(r) = parse_event_fields(f, cx, &mut st.dates) { st.buckets[(r.eid >> B1_SHIFT) as usize].push(r); }
+            }
+            pos += len + 1;
+        }
+    }
+}
+
 // ---------------------------------------------------------------- context tables
 
 struct SmallMap {
@@ -565,7 +606,11 @@ struct Ck {
 
 #[inline(always)]
 fn parse_event(line: &[u8], cx: &Ctx, dates: &mut DateCache) -> Option<Raw> {
-    let f = split::<7>(line)?;
+    parse_event_fields(split::<7>(line)?, cx, dates)
+}
+
+#[inline(always)]
+fn parse_event_fields(f: [&[u8]; 7], cx: &Ctx, dates: &mut DateCache) -> Option<Raw> {
     let [eid, user, ts, ing, ty, prod, price] = f;
     if eid.is_empty() {
         return None;
@@ -766,6 +811,7 @@ fn dedup_bucket(b: usize, p1: &[P1], links: &LinkTable, st: &mut P2) {
     if n == 0 {
         return;
     }
+    let bucket_time = std::time::Instant::now();
     let recs = &mut st.recs;
     recs.clear();
     recs.reserve(n);
@@ -778,11 +824,18 @@ fn dedup_bucket(b: usize, p1: &[P1], links: &LinkTable, st: &mut P2) {
     tab.clear();
     tab.resize(cap, 0);
 
+    COLLECT_NS.fetch_add(bucket_time.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    let bucket_time = std::time::Instant::now();
     // Keep a short hash tag beside each record index. Most occupied
     // slots have a different tag, so probing does not touch the record.
     let index_bits = u32::try_from(n).expect("dedup bucket too large");
     let index_mask = u32::MAX >> index_bits.leading_zeros();
     for i in 0..n {
+        #[cfg(target_arch = "x86_64")]
+        if i + 16 < n {
+            let next = (recs[i + 16].eid as usize) & mask;
+            unsafe { std::arch::x86_64::_mm_prefetch(tab.as_ptr().add(next).cast(), std::arch::x86_64::_MM_HINT_T0); }
+        }
         let e = recs[i].eid;
         let tag = ((e >> 32) as u32) & !index_mask;
         let slot_value = tag | (i as u32 + 1);
@@ -808,7 +861,15 @@ fn dedup_bucket(b: usize, p1: &[P1], links: &LinkTable, st: &mut P2) {
             s = (s + 1) & mask;
         }
     }
-    for r in recs.iter() {
+    INDEX_NS.fetch_add(bucket_time.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    let bucket_time = std::time::Instant::now();
+    for i in 0..recs.len() {
+        #[cfg(target_arch = "x86_64")]
+        if i + 16 < recs.len() {
+            let slot = (recs[i + 16].uh as usize) & links.mask;
+            unsafe { std::arch::x86_64::_mm_prefetch(links.slots.as_ptr().add(slot).cast(), std::arch::x86_64::_MM_HINT_T0); }
+        }
+        let r = &recs[i];
         if r.flags & F_VALID == 0 {
             continue;
         }
@@ -819,6 +880,7 @@ fn dedup_bucket(b: usize, p1: &[P1], links: &LinkTable, st: &mut P2) {
         let pc = (r.price as u64) | ((r.cat as u64) << 32) | (if r.flags & F_PURCH != 0 { 1u64 << 62 } else { 0 });
         st.ev[(key >> B2_SHIFT) as usize].push(Ev { key, ts: r.ts, ptr, pc });
     }
+    RESOLVE_NS.fetch_add(bucket_time.elapsed().as_nanos() as u64, Ordering::Relaxed);
 }
 
 // ---------------------------------------------------------------- phase 3: sessions
@@ -860,6 +922,12 @@ struct W3 {
     runs: Vec<Run>,
     daycats: Vec<(u16, i64)>,
     tmp: Vec<(u32, i64)>,
+    groups: Vec<Group>,
+    index: Vec<u32>,
+    ev_ids: Vec<u32>,
+    ck_ids: Vec<u32>,
+    ordered_ev: Vec<Ev>,
+    ordered_ck: Vec<Ck>,
 }
 
 const USER_SCHEMA: &str = "message user_daily { REQUIRED BINARY user_id (STRING); REQUIRED INT32 day (DATE); REQUIRED INT64 sessions; REQUIRED INT64 events; REQUIRED INT64 revenue_cents; OPTIONAL BINARY top_category (STRING); }";
@@ -1077,6 +1145,17 @@ fn top_cat(c: &[(u16, i64)]) -> u16 {
     best
 }
 
+#[derive(Clone, Copy)]
+struct Group {
+    key: u64,
+    ec: usize,
+    cc: usize,
+    es: usize,
+    cs: usize,
+    ei: usize,
+    ci: usize,
+}
+
 fn phase3_bucket(b: usize, p2: &[P2], st: &mut W3, cx: &Ctx, out_dir: &str) {
     st.evbuf.clear();
     st.ckbuf.clear();
@@ -1084,47 +1163,79 @@ fn phase3_bucket(b: usize, p2: &[P2], st: &mut W3, cx: &Ctx, out_dir: &str) {
         st.evbuf.extend_from_slice(&w.ev[b]);
         st.ckbuf.extend_from_slice(&w.ck[b]);
     }
-    if st.evbuf.is_empty() {
-        return;
-    }
-    st.evbuf.sort_unstable_by(|a, b| a.key.cmp(&b.key).then(a.ts.cmp(&b.ts)));
-    st.ckbuf.sort_unstable_by(|a, b| {
-        a.key
-            .cmp(&b.key)
-            .then(a.ts.cmp(&b.ts))
-            .then_with(|| unpack(a.cid).cmp(unpack(b.cid)))
-    });
-    let evbuf = std::mem::take(&mut st.evbuf);
-    let ckbuf = std::mem::take(&mut st.ckbuf);
-    let mut ci = 0usize;
-    let mut i = 0usize;
-    while i < evbuf.len() {
-        let key = evbuf[i].key;
-        let mut j = i + 1;
-        while j < evbuf.len() && evbuf[j].key == key {
-            j += 1;
+    let n = st.evbuf.len();
+    if n == 0 { return; }
+    let cap = (2*n).next_power_of_two().max(16);
+    let mask = cap - 1;
+    st.index.clear(); st.index.resize(cap, u32::MAX);
+    st.groups.clear(); st.ev_ids.clear(); st.ck_ids.clear();
+    for e in &st.evbuf {
+        let mut j = (e.key as usize) & mask;
+        loop {
+            let gid = st.index[j];
+            if gid == u32::MAX {
+                let id = st.groups.len() as u32;
+                st.groups.push(Group {key:e.key, ec:1, cc:0, es:0, cs:0, ei:0, ci:0});
+                st.index[j] = id;
+                st.ev_ids.push(id);
+                break;
+            }
+            if st.groups[gid as usize].key == e.key {
+                st.groups[gid as usize].ec += 1;
+                st.ev_ids.push(gid);
+                break;
+            }
+            j = (j + 1) & mask;
         }
-        while ci < ckbuf.len() && ckbuf[ci].key < key {
-            ci += 1;
-        }
-        let mut ce = ci;
-        while ce < ckbuf.len() && ckbuf[ce].key == key {
-            ce += 1;
-        }
-        process_person(&evbuf[i..j], &ckbuf[ci..ce], st, cx);
-        ci = ce;
-        i = j;
     }
-    st.evbuf = evbuf;
-    st.ckbuf = ckbuf;
-    if st.rows.len() >= 200_000 {
-        flush_user_rows(st, cx, out_dir);
+    for ck in &st.ckbuf {
+        let mut j = (ck.key as usize) & mask;
+        loop {
+            let gid = st.index[j];
+            if gid == u32::MAX { st.ck_ids.push(gid); break; }
+            if st.groups[gid as usize].key == ck.key {
+                st.groups[gid as usize].cc += 1;
+                st.ck_ids.push(gid);
+                break;
+            }
+            j = (j+1)&mask;
+        }
     }
+    let mut es = 0; let mut cs = 0;
+    for g in &mut st.groups {
+        g.es = es; g.ei = es; es += g.ec;
+        g.cs = cs; g.ci = cs; cs += g.cc;
+    }
+    st.ordered_ev.clear(); st.ordered_ev.extend_from_slice(&st.evbuf);
+    st.ordered_ck.clear(); st.ordered_ck.extend_from_slice(&st.ckbuf);
+    for (e, &gid) in st.evbuf.iter().zip(&st.ev_ids) {
+        let g = &mut st.groups[gid as usize];
+        st.ordered_ev[g.ei] = *e; g.ei += 1;
+    }
+    for (ck, &gid) in st.ckbuf.iter().zip(&st.ck_ids) {
+        if gid != u32::MAX {
+            let g = &mut st.groups[gid as usize];
+            st.ordered_ck[g.ci] = *ck; g.ci += 1;
+        }
+    }
+    let mut ev = std::mem::take(&mut st.ordered_ev);
+    let mut ck = std::mem::take(&mut st.ordered_ck);
+    let groups = std::mem::take(&mut st.groups);
+    for g in &groups {
+        let events = &mut ev[g.es..g.es+g.ec];
+        let clicks = &mut ck[g.cs..g.cs+g.cc];
+        events.sort_unstable_by_key(|e| e.ts);
+        clicks.sort_unstable_by(|a,b| a.ts.cmp(&b.ts).then_with(|| unpack(a.cid).cmp(unpack(b.cid))));
+        process_person(events, clicks, st, cx);
+    }
+    st.ordered_ev = ev; st.ordered_ck = ck; st.groups = groups;
+    if st.rows.len() >= 200_000 { flush_user_rows(st,cx,out_dir); }
 }
 
 // ---------------------------------------------------------------- main
 
 fn main() {
+    let overall=std::time::Instant::now();
     let data = std::env::var("DATA_DIR").unwrap_or_else(|_| "/data".into());
     let out = std::env::var("OUTPUT_DIR").unwrap_or_else(|_| "/output".into());
     let nthreads: usize = std::env::var("NCPU")
@@ -1191,6 +1302,8 @@ fn main() {
     std::fs::create_dir_all(format!("{}/user_daily", out)).unwrap();
     std::fs::create_dir_all(format!("{}/campaign_daily", out)).unwrap();
 
+    eprintln!("setup {:?}", overall.elapsed());
+    let stage = std::time::Instant::now();
     // phase 1: parse events (+ links in a side thread)
     let (links, p1): (LinkTable, Vec<P1>) = thread::scope(|sc| {
         let lh = sc.spawn(|| build_links(&ln_files));
@@ -1201,7 +1314,19 @@ fn main() {
             |_| P1 { dates: DateCache::new(), buckets: (0..B1).map(|_| Vec::new()).collect() },
             |st, ti| {
                 let (fi, a, b) = ev_chunks[ti];
-                for_lines(&ev_files[fi][a..b], a == 0, |l| {
+                let data = &ev_files[fi][a..b];
+                #[cfg(target_arch = "x86_64")]
+                if std::arch::is_x86_feature_detected!("avx512bw") {
+                    unsafe { parse_events_fast(data, a == 0, &cx, st); }
+                } else {
+                    for_lines(data, a == 0, |l| {
+                        if let Some(r) = parse_event(l, &cx, &mut st.dates) {
+                            st.buckets[(r.eid >> B1_SHIFT) as usize].push(r);
+                        }
+                    });
+                }
+                #[cfg(not(target_arch = "x86_64"))]
+                for_lines(data, a == 0, |l| {
                     if let Some(r) = parse_event(l, &cx, &mut st.dates) {
                         st.buckets[(r.eid >> B1_SHIFT) as usize].push(r);
                     }
@@ -1212,6 +1337,8 @@ fn main() {
         (lh.join().unwrap(), p1)
     });
 
+    eprintln!("parse {:?}", stage.elapsed());
+    let stage = std::time::Instant::now();
     // phase 2: clicks + dedup buckets
     let nck = ck_chunks.len();
     let p2: Vec<P2> = par_run(
@@ -1236,6 +1363,8 @@ fn main() {
     drop(p1);
     drop(links);
 
+    eprintln!("dedup {:?}, sum of worker times: collect {}ms index {}ms resolve {}ms", stage.elapsed(), COLLECT_NS.load(Ordering::Relaxed)/1000000, INDEX_NS.load(Ordering::Relaxed)/1000000, RESOLVE_NS.load(Ordering::Relaxed)/1000000);
+    let stage = std::time::Instant::now();
     // phase 3: sessions, attribution, output
     let mut sizes: Vec<(usize, usize)> = (0..B2).map(|b| (p2.iter().map(|w| w.ev[b].len()).sum::<usize>(), b)).collect();
     sizes.sort_by(|a, b| b.0.cmp(&a.0));
@@ -1257,6 +1386,12 @@ fn main() {
             runs: Vec::new(),
             daycats: Vec::new(),
             tmp: Vec::new(),
+            groups: Vec::new(),
+            index: Vec::new(),
+            ev_ids: Vec::new(),
+            ck_ids: Vec::new(),
+            ordered_ev: Vec::new(),
+            ordered_ck: Vec::new(),
         },
         |st, b| phase3_bucket(b, &p2, st, &cx, &out),
         |st| {
@@ -1268,6 +1403,8 @@ fn main() {
     );
     drop(p2);
 
+    eprintln!("sessions {:?}", stage.elapsed());
+    let stage = std::time::Instant::now();
     let mut total = vec![[0i64; 4]; nc1 * ndays];
     let mut nfiles = 0;
     for w in w3s {
@@ -1283,6 +1420,7 @@ fn main() {
         wr.close().unwrap();
     }
 
+    eprintln!("reduce {:?}", stage.elapsed());
     // campaign_daily
     let mut wr = new_writer(&format!("{}/campaign_daily/part-0.parquet", out), CAMP_SCHEMA);
     let mut cid: Vec<ByteArray> = vec![];
@@ -1327,6 +1465,7 @@ fn main() {
         rg.close().unwrap();
     }
     wr.close().unwrap();
+    eprintln!("total {:?}", overall.elapsed());
 }
 
 #[cfg(test)]
