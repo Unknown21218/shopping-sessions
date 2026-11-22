@@ -9,9 +9,10 @@ repository.
 ## Processing
 
 - Memory-map the CSVs, scan line-aligned chunks in parallel, and validate
-  CSV syntax before deduplication. Select the AVX-512 or AVX2 event scanner
-  at runtime, and use AVX-512 for short click rows when available. Other
-  CPUs and exceptional rows use the portable parser.
+  CSV syntax before deduplication. Select the AVX-512 or AVX2 scanner
+  for events and clicks at runtime, and decode common 13-digit epoch
+  timestamps with SIMD. Long rows, chunk tails, and unsupported CPUs
+  use the portable CSV splitter.
 - Build the linked-ID components while parsing. Only aliases need entries
   in the lookup table. Short ASCII IDs use exact compact keys and a
   worker-local cache; other IDs are compared by their full bytes.
@@ -23,14 +24,17 @@ repository.
 - Keep event timestamps and purchase metadata packed during grouping and
   sorting, with a wide fallback for longer windows. A single event needs
   no sort; for heavy histories with a bounded window, aggregate inside
-  half-open 30-minute buckets and check the exact gap between nonempty
-  buckets. A single session needs no click sort: scan once for last-touch
+  half-open 30-minute buckets, using a bitmap to skip empty buckets and
+  comparing actual timestamps in occupied ones. A single session needs
+  no click sort: scan once for last-touch
   attribution and distinct assisting campaigns. For longer histories,
   sweep sorted clicks and combine overlapping assist intervals per
   campaign. Identical copies of a click do not change the results.
-- Write the Parquet parts directly. Set `PIPELINE_PROFILE=1` for per-phase
-  timings on stderr or `PIPELINE_AVX2=1` to test the AVX2 event scanner on
-  a machine that also supports AVX-512.
+- Write Parquet parts directly. Use 32-bit user counts only when the
+  total input byte size proves they fit; keep 64-bit counts otherwise
+  and 64-bit revenue in either case. Set `PIPELINE_PROFILE=1` for phase
+  timings on stderr or `PIPELINE_AVX2=1` to select AVX2 on a machine
+  that also supports AVX-512.
 
 ## Local verification
 

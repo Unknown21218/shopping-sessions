@@ -468,6 +468,32 @@ fn parse_ts(f: &[u8], cache: &mut DateCache) -> Option<i64> {
     parse_epoch(f)
 }
 
+#[inline(always)]
+fn parse_row_timestamp<const VECTOR: bool>(f: &[u8], cache: &mut DateCache) -> Option<i64> {
+    #[cfg(target_arch = "x86_64")]
+    if VECTOR && f.len() == 13 {
+        use std::arch::x86_64::*;
+        // Overlapping reads cover every byte without crossing the field end.
+        let first = u64::from_le_bytes(f[..8].try_into().unwrap());
+        let last = u64::from_le_bytes(f[5..].try_into().unwrap());
+        return unsafe {
+            let text = _mm_set_epi64x(last as i64, first as i64);
+            let digits = _mm_sub_epi8(text, _mm_set1_epi8(b'0' as i8));
+            let excess = _mm_subs_epu8(digits, _mm_set1_epi8(9));
+            if _mm_testz_si128(excess, excess) == 0 {
+                None
+            } else {
+                let pairs = _mm_maddubs_epi16(digits, _mm_set1_epi16(0x010a));
+                let quads = _mm_madd_epi16(pairs, _mm_set1_epi32(0x0001_0064));
+                let high = i64::from(_mm_cvtsi128_si32(quads)) * 10 + i64::from(f[4] - b'0');
+                let low = _mm_cvtsi128_si64(_mm_srli_si128::<8>(quads)) as u64;
+                Some(high * 100_000_000 + i64::from(low as u32) * 10_000 + (low >> 32) as i64)
+            }
+        };
+    }
+    parse_ts(f, cache)
+}
+
 #[cold]
 fn parse_epoch(mut f: &[u8]) -> Option<i64> {
     if f.is_empty() {
@@ -629,130 +655,168 @@ fn for_lines<'a>(data: &'a [u8], first: bool, mut f: impl FnMut(&'a [u8])) {
 }
 
 #[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx512bw,bmi2")]
+#[target_feature(enable = "avx512bw,bmi2,popcnt")]
 unsafe fn parse_events_fast(data: &[u8], first: bool, cx: &Ctx, st: &mut P1, links: Option<&LinkTable>) {
+    scan_rows_avx512::<7>(data, first, |fields| {
+        if let Some(row) = parse_event_fields::<true>(fields, cx, &mut st.dates) {
+            st.route_event(row, links);
+        }
+    });
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512bw,bmi2,popcnt")]
+unsafe fn parse_clicks_fast(data: &[u8], first: bool, cx: &Ctx, st: &mut P1, links: Option<&LinkTable>) {
+    scan_rows_avx512::<4>(data, first, |fields| {
+        if let Some(row) = parse_click_fields::<true>(fields, cx, &mut st.dates) {
+            st.route_click(row, links);
+        }
+    });
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+unsafe fn scan_rows_avx512<const N: usize>(data: &[u8], first: bool, mut visit: impl FnMut([&[u8]; N])) {
     use std::arch::x86_64::*;
     let mut pos = if first { memchr(b'\n', data).map_or(data.len(), |i| i + 1) } else { 0 };
     let comma = _mm512_set1_epi8(b',' as i8);
     let quote = _mm512_set1_epi8(b'"' as i8);
     let newline = _mm512_set1_epi8(b'\n' as i8);
-    while pos < data.len() {
-        let available = data.len() - pos;
-        let m = u64::MAX >> (64usize.saturating_sub(available));
-        let v = _mm512_maskz_loadu_epi8(m, data.as_ptr().add(pos).cast());
-        let newlines = _mm512_cmpeq_epi8_mask(v, newline);
-        let mut commas = u128::from(_mm512_cmpeq_epi8_mask(v, comma));
-        let mut quotes = u128::from(_mm512_cmpeq_epi8_mask(v, quote));
-        let mut len = if newlines != 0 { newlines.trailing_zeros() as usize } else { available.min(64) };
-        if len == 64 && available > 64 {
-            let m = u64::MAX >> (128usize.saturating_sub(available));
-            let v = _mm512_maskz_loadu_epi8(m, data.as_ptr().add(pos + 64).cast());
-            let newlines = _mm512_cmpeq_epi8_mask(v, newline);
-            commas |= u128::from(_mm512_cmpeq_epi8_mask(v, comma)) << 64;
-            quotes |= u128::from(_mm512_cmpeq_epi8_mask(v, quote)) << 64;
-            len = if newlines != 0 { 64 + newlines.trailing_zeros() as usize } else { available.min(128) };
-        }
-        if len == 128 && available > 128 {
-            let end = memchr(b'\n', &data[pos..]).map_or(data.len(), |i| pos + i);
-            if let Some(r) = parse_event(&data[pos..end], cx, &mut st.dates) { st.route_event(r, links); }
-            pos = end + 1;
+    while pos + 128 <= data.len() {
+        let p = data.as_ptr().add(pos);
+        let a = _mm512_loadu_si512(p.cast());
+        let nl = _mm512_cmpeq_epi8_mask(a, newline);
+        let c = _mm512_cmpeq_epi8_mask(a, comma);
+        let q = _mm512_cmpeq_epi8_mask(a, quote);
+        let (len, commas, quotes) = if nl != 0 {
+            let cut = nl.trailing_zeros();
+            (cut as usize, u128::from(_bzhi_u64(c, cut)), u128::from(_bzhi_u64(q, cut)))
         } else {
-            let mask = if len == 128 { u128::MAX } else { (1u128 << len) - 1 };
-            if let Some(f) = split_masks::<7>(&data[pos..pos + len], commas & mask, quotes & mask) {
-                if let Some(r) = parse_event_fields::<true>(f, cx, &mut st.dates) { st.route_event(r, links); }
+            let b = _mm512_loadu_si512(p.add(64).cast());
+            let nl = _mm512_cmpeq_epi8_mask(b, newline);
+            if nl == 0 {
+                let end = memchr(b'\n', &data[pos + 128..]).map_or(data.len(), |i| pos + 128 + i);
+                if let Some(fields) = split_scalar::<N>(&data[pos..end]) {
+                    visit(fields);
+                }
+                pos = (end + 1).min(data.len());
+                continue;
             }
-            pos += len + 1;
+            let cut = nl.trailing_zeros();
+            let c1 = _bzhi_u64(_mm512_cmpeq_epi8_mask(b, comma), cut);
+            let q1 = _bzhi_u64(_mm512_cmpeq_epi8_mask(b, quote), cut);
+            (64 + cut as usize, u128::from(c) | (u128::from(c1) << 64), u128::from(q) | (u128::from(q1) << 64))
+        };
+        if let Some(fields) = split_masks_bmi2::<N>(&data[pos..pos + len], commas, quotes) {
+            visit(fields);
         }
+        pos += len + 1;
     }
+    for_lines(&data[pos..], false, |line| {
+        if let Some(fields) = split_scalar::<N>(line) { visit(fields); }
+    });
 }
 
 #[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx2,bmi2")]
+#[target_feature(enable = "avx2,bmi2,popcnt")]
 unsafe fn parse_events_avx2(data: &[u8], first: bool, cx: &Ctx, st: &mut P1, links: Option<&LinkTable>) {
+    scan_rows_avx2::<7>(data, first, |fields| {
+        if let Some(row) = parse_event_fields::<true>(fields, cx, &mut st.dates) {
+            st.route_event(row, links);
+        }
+    });
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,bmi2,popcnt")]
+unsafe fn parse_clicks_avx2(data: &[u8], first: bool, cx: &Ctx, st: &mut P1, links: Option<&LinkTable>) {
+    scan_rows_avx2::<4>(data, first, |fields| {
+        if let Some(row) = parse_click_fields::<true>(fields, cx, &mut st.dates) {
+            st.route_click(row, links);
+        }
+    });
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+unsafe fn scan_rows_avx2<const N: usize>(data: &[u8], first: bool, mut visit: impl FnMut([&[u8]; N])) {
     use std::arch::x86_64::*;
     let mut pos = if first { memchr(b'\n', data).map_or(data.len(), |i| i + 1) } else { 0 };
     let comma = _mm256_set1_epi8(b',' as i8);
     let quote = _mm256_set1_epi8(b'"' as i8);
     let newline = _mm256_set1_epi8(b'\n' as i8);
-    while pos < data.len() {
-        let mut commas = 0u128;
-        let mut quotes = 0u128;
-        let mut matched = false;
-        for offset in [0, 32, 64, 96] {
-            if pos + offset + 32 > data.len() {
-                break;
-            }
-            let v = _mm256_loadu_si256(data.as_ptr().add(pos + offset).cast());
-            let nl = _mm256_movemask_epi8(_mm256_cmpeq_epi8(v, newline)) as u32;
-            let c = _mm256_movemask_epi8(_mm256_cmpeq_epi8(v, comma)) as u32;
-            let q = _mm256_movemask_epi8(_mm256_cmpeq_epi8(v, quote)) as u32;
-            if nl != 0 {
-                let end = nl.trailing_zeros();
-                let mask = (1u32 << end) - 1;
-                commas |= u128::from(c & mask) << offset;
-                quotes |= u128::from(q & mask) << offset;
-                let end = pos + offset + end as usize;
-                if let Some(f) = split_masks::<7>(&data[pos..end], commas, quotes) {
-                    if let Some(r) = parse_event_fields::<true>(f, cx, &mut st.dates) {
-                        st.route_event(r, links);
-                    }
-                }
-                pos = end + 1;
-                matched = true;
-                break;
-            }
-            commas |= u128::from(c) << offset;
-            quotes |= u128::from(q) << offset;
-        }
-        if !matched {
-            // An exceptionally long row, or a tail too short to load
-            // safely with AVX2, uses the width-independent parser.
-            let end = memchr(b'\n', &data[pos..]).map_or(data.len(), |i| pos + i);
-            if let Some(f) = split::<7>(&data[pos..end]) {
-                if let Some(r) = parse_event_fields::<true>(f, cx, &mut st.dates) {
-                    st.route_event(r, links);
-                }
-            }
-            pos = end + 1;
-        }
+    // Pair two YMM masks into one word. Most rows need either one or
+    // two words; only the tail and very long rows use the scalar splitter.
+    macro_rules! mask64 {
+        ($a:expr, $b:expr, $ch:expr) => {
+            u64::from(_mm256_movemask_epi8(_mm256_cmpeq_epi8($a, $ch)) as u32)
+                | (u64::from(_mm256_movemask_epi8(_mm256_cmpeq_epi8($b, $ch)) as u32) << 32)
+        };
     }
+    while pos + 128 <= data.len() {
+        let p = data.as_ptr().add(pos);
+        let a = _mm256_loadu_si256(p.cast());
+        let b = _mm256_loadu_si256(p.add(32).cast());
+        let nl = mask64!(a, b, newline);
+        let c = mask64!(a, b, comma);
+        let q = mask64!(a, b, quote);
+        let (len, commas, quotes) = if nl != 0 {
+            let cut = nl.trailing_zeros();
+            (cut as usize, u128::from(_bzhi_u64(c, cut)), u128::from(_bzhi_u64(q, cut)))
+        } else {
+            let a = _mm256_loadu_si256(p.add(64).cast());
+            let b = _mm256_loadu_si256(p.add(96).cast());
+            let nl = mask64!(a, b, newline);
+            if nl == 0 {
+                let end = memchr(b'\n', &data[pos + 128..]).map_or(data.len(), |i| pos + 128 + i);
+                if let Some(fields) = split_scalar::<N>(&data[pos..end]) {
+                    visit(fields);
+                }
+                pos = (end + 1).min(data.len());
+                continue;
+            }
+            let cut = nl.trailing_zeros();
+            let c1 = _bzhi_u64(mask64!(a, b, comma), cut);
+            let q1 = _bzhi_u64(mask64!(a, b, quote), cut);
+            (64 + cut as usize, u128::from(c) | (u128::from(c1) << 64), u128::from(q) | (u128::from(q1) << 64))
+        };
+        if let Some(fields) = split_masks_bmi2::<N>(&data[pos..pos + len], commas, quotes) {
+            visit(fields);
+        }
+        pos += len + 1;
+    }
+    for_lines(&data[pos..], false, |line| {
+        if let Some(fields) = split_scalar::<N>(line) { visit(fields); }
+    });
 }
 
 #[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx512bw,bmi2")]
-unsafe fn parse_clicks_fast(data: &[u8], first: bool, cx: &Ctx, st: &mut P1, links: Option<&LinkTable>) {
-    use std::arch::x86_64::*;
-    let mut pos = if first { memchr(b'\n', data).map_or(data.len(), |i| i + 1) } else { 0 };
-    let comma = _mm512_set1_epi8(b',' as i8);
-    let quote = _mm512_set1_epi8(b'"' as i8);
-    let newline = _mm512_set1_epi8(b'\n' as i8);
-    while pos + 64 <= data.len() {
-        let v = _mm512_loadu_si512(data.as_ptr().add(pos).cast());
-        let nl = _mm512_cmpeq_epi8_mask(v, newline);
-        if nl != 0 {
-            let n = nl.trailing_zeros() as usize;
-            let m = (1u64 << n) - 1;
-            let commas = u128::from(_mm512_cmpeq_epi8_mask(v, comma) & m);
-            let quotes = u128::from(_mm512_cmpeq_epi8_mask(v, quote) & m);
-            if let Some(f) = split_masks::<4>(&data[pos..pos + n], commas, quotes) {
-                if let Some(c) = parse_click_fields::<true>(f, cx, &mut st.dates) {
-                    st.route_click(c, links);
-                }
-            }
-            pos += n + 1;
-        } else {
-            let end = memchr(b'\n', &data[pos..]).map_or(data.len(), |i| pos + i);
-            if let Some(c) = parse_click(&data[pos..end], cx, &mut st.dates) {
-                st.route_click(c, links);
-            }
-            pos = (end + 1).min(data.len());
-        }
+#[inline(always)]
+unsafe fn split_masks_bmi2<const N: usize>(line: &[u8], mut commas: u128, quotes: u128) -> Option<[&[u8]; N]> {
+    use std::arch::x86_64::_pext_u64;
+    if commas.count_ones() as usize != N - 1 { return None; }
+    // The scanners remove all bits past the line ending. These callers
+    // have at least two fields, so the comma count also proves len > 0.
+    let starts = (commas << 1) | 1;
+    let opens = quotes & starts;
+    let ends = (commas >> 1) | (1u128 << (line.len() - 1));
+    let closes = commas.wrapping_sub(opens) & !commas & ends;
+    if quotes != (opens | closes) || opens & closes != 0 { return None; }
+    let lo = starts as u64;
+    let mut quoted = _pext_u64(quotes as u64, lo)
+        | (_pext_u64((quotes >> 64) as u64, (starts >> 64) as u64) << lo.count_ones());
+    let mut out = [&[][..]; N];
+    let mut start = 0;
+    for (i, field) in out.iter_mut().enumerate() {
+        let end = if i + 1 == N { line.len() } else { commas.trailing_zeros() as usize };
+        commas &= commas.wrapping_sub(1);
+        let q = (quoted & 1) as usize;
+        quoted >>= 1;
+        // Distinct opening and closing quotes guarantee room to trim.
+        *field = line.get_unchecked(start + q..end - q);
+        start = end + 1;
     }
-    for_lines(&data[pos..], false, |line| {
-        if let Some(c) = parse_click(line, cx, &mut st.dates) {
-            st.route_click(c, links);
-        }
-    });
+    Some(out)
 }
 
 // ---------------------------------------------------------------- context tables
@@ -802,6 +866,7 @@ struct Ctx {
     ws: i64,
     we: i64,
     compact_events: bool,
+    small_counts: bool,
     click_lo: i64,
     day0: i64,
     ndays: usize,
@@ -947,7 +1012,7 @@ fn parse_event_fields<const BMI2: bool>(f: [&[u8]; 7], cx: &Ctx, dates: &mut Dat
         _ => return Some(r),
     };
     let utc = ts.len() == 20 && ts[19] == b'Z';
-    let t = match if utc { parse_iso::<true>(ts, dates) } else { parse_ts(ts, dates) } {
+    let t = match if utc { parse_iso::<true>(ts, dates) } else { parse_row_timestamp::<BMI2>(ts, dates) } {
         Some(t) if t >= cx.ws && t < cx.we => t,
         _ => return Some(r),
     };
@@ -1126,6 +1191,7 @@ fn build_links(files: &[&'static [u8]]) -> LinkTable {
     let mut components = 0;
     for (i, node) in nodes.iter().enumerate() {
         let r = find(&mut parent, i as u32) as usize;
+        parent[i] = r as u32;
         let b = best[r];
         components += usize::from(b == u32::MAX);
         if b == u32::MAX || unpack(node.ptr) < unpack(nodes[b as usize].ptr) {
@@ -1136,7 +1202,7 @@ fn build_links(files: &[&'static [u8]]) -> LinkTable {
     // itself, and omitting it keeps the table smaller for the hot probes.
     let mut out = LinkTable::alias_table(nodes.len() - components);
     for (i, node) in nodes.iter().enumerate() {
-        let root = find(&mut parent, i as u32) as usize;
+        let root = parent[i] as usize;
         if best[root] as usize != i {
             let canonical = nodes[best[root] as usize];
             out.insert(node.code, node.ptr, canonical.code, canonical.ptr);
@@ -1321,7 +1387,7 @@ fn parse_click_fields<const BMI2: bool>(f: [&[u8]; 4], cx: &Ctx, dates: &mut Dat
     if cid.is_empty() || user.is_empty() {
         return None;
     }
-    let t = match parse_ts(ts, dates) {
+    let t = match parse_row_timestamp::<BMI2>(ts, dates) {
         Some(t) if t >= cx.click_lo && t < cx.we => t,
         _ => return None,
     };
@@ -1435,6 +1501,7 @@ struct TimeBin {
 #[derive(Default)]
 struct Binned {
     bins: Vec<TimeBin>,
+    active: Vec<u64>,
     purchases: Vec<(usize, u32, u32)>,
     cat_totals: Vec<i64>,
 }
@@ -1463,6 +1530,7 @@ struct W3 {
 }
 
 const USER_SCHEMA: &str = "message user_daily { REQUIRED BINARY user_id (STRING); REQUIRED INT32 day (DATE); REQUIRED INT64 sessions; REQUIRED INT64 events; REQUIRED INT64 revenue_cents; OPTIONAL BINARY top_category (STRING); }";
+const USER_SCHEMA_SMALL: &str = "message user_daily { REQUIRED BINARY user_id (STRING); REQUIRED INT32 day (DATE); REQUIRED INT32 sessions; REQUIRED INT32 events; REQUIRED INT64 revenue_cents; OPTIONAL BINARY top_category (STRING); }";
 const CAMP_SCHEMA: &str = "message campaign_daily { REQUIRED BINARY campaign_id (STRING); REQUIRED BINARY channel (STRING); REQUIRED INT32 day (DATE); REQUIRED INT64 sessions; REQUIRED INT64 purchasing_sessions; REQUIRED INT64 revenue_cents; REQUIRED INT64 assisted_sessions; }";
 
 #[inline]
@@ -1489,7 +1557,8 @@ fn flush_user_rows(st: &mut W3, cx: &Ctx, out_dir: &str) {
         return;
     }
     if st.writer.is_none() {
-        st.writer = Some(new_writer(&format!("{}/user_daily/part-{}.parquet", out_dir, st.id), USER_SCHEMA));
+        let schema = if cx.small_counts { USER_SCHEMA_SMALL } else { USER_SCHEMA };
+        st.writer = Some(new_writer(&format!("{}/user_daily/part-{}.parquet", out_dir, st.id), schema));
         st.nfiles += 1;
     }
     let w = st.writer.as_mut().unwrap();
@@ -1529,16 +1598,18 @@ fn flush_user_rows(st: &mut W3, cx: &Ctx, out_dir: &str) {
     }
     for sel in 0..3 {
         let mut c = rg.next_column().unwrap().unwrap();
-        let v: Vec<i64> = st
-            .rows
-            .iter()
-            .map(|r| match sel {
-                0 => r.sessions,
-                1 => r.events,
-                _ => r.rev,
-            })
-            .collect();
-        c.typed::<Int64Type>().write_batch(&v, None, None).unwrap();
+        let value = |r: &UserRow| match sel {
+            0 => r.sessions,
+            1 => r.events,
+            _ => r.rev,
+        };
+        if cx.small_counts && sel < 2 {
+            let v: Vec<i32> = st.rows.iter().map(|r| value(r) as i32).collect();
+            c.typed::<Int32Type>().write_batch(&v, None, None).unwrap();
+        } else {
+            let v: Vec<i64> = st.rows.iter().map(value).collect();
+            c.typed::<Int64Type>().write_batch(&v, None, None).unwrap();
+        }
         c.close().unwrap();
     }
     {
@@ -1615,8 +1686,9 @@ impl Binned {
         &mut self, evs: &[TimedEvent], ws: i64, bins: usize, categories: usize,
         sess: &mut Vec<Sess>, runs: &mut Vec<Run>,
     ) {
-        self.bins.clear();
         self.bins.resize(bins, TimeBin::default());
+        self.active.clear();
+        self.active.resize(bins.div_ceil(64), 0);
         self.purchases.clear();
         sess.clear();
         runs.clear();
@@ -1624,9 +1696,11 @@ impl Binned {
             let (ts, price, category) = e.parts(ws);
             let i = ((ts - ws) / GAP_MS) as usize;
             let b = &mut self.bins[i];
-            if b.events == 0 {
-                b.first = ts;
-                b.last = ts;
+            let word = &mut self.active[i >> 6];
+            let bit = 1u64 << (i & 63);
+            if *word & bit == 0 {
+                *word |= bit;
+                *b = TimeBin { first: ts, last: ts, events: 0, rev: 0, run: 0 };
             } else {
                 b.first = b.first.min(ts);
                 b.last = b.last.max(ts);
@@ -1642,27 +1716,30 @@ impl Binned {
         // the gap from one nonempty bin's last event to the next bin's
         // first event can create a break, at the exact same cutoff.
         let mut prev = 0;
-        for b in &mut self.bins {
-            if b.events == 0 {
-                continue;
-            }
-            if sess.is_empty() || b.first - prev > GAP_MS {
-                let day = floor_div(b.first, DAY_MS);
-                if runs.last().is_none_or(|r| r.day != day) {
-                    runs.push(Run { day, first: sess.len() as u32, end: 0, events: 0, rev: 0, top: NO_CAT });
+        for (block, &active) in self.active.iter().enumerate() {
+            let mut active = active;
+            while active != 0 {
+                let i = (block << 6) | active.trailing_zeros() as usize;
+                active &= active - 1;
+                let b = &mut self.bins[i];
+                if sess.is_empty() || b.first - prev > GAP_MS {
+                    let day = floor_div(b.first, DAY_MS);
+                    if runs.last().is_none_or(|r| r.day != day) {
+                        runs.push(Run { day, first: sess.len() as u32, end: 0, events: 0, rev: 0, top: NO_CAT });
+                    }
+                    sess.push(Sess { start: b.first, rev: 0, purch: false, run: (runs.len() - 1) as u32 });
                 }
-                sess.push(Sess { start: b.first, rev: 0, purch: false, run: (runs.len() - 1) as u32 });
-            }
-            b.run = (runs.len() - 1) as u32;
-            prev = b.last;
-            let r = runs.last_mut().unwrap();
-            r.events += i64::from(b.events);
-            r.rev += b.rev;
-            r.end = sess.len() as u32;
-            if b.rev != 0 {
-                let s = sess.last_mut().unwrap();
-                s.rev += b.rev;
-                s.purch = true;
+                b.run = (runs.len() - 1) as u32;
+                prev = b.last;
+                let r = runs.last_mut().unwrap();
+                r.events += i64::from(b.events);
+                r.rev += b.rev;
+                r.end = sess.len() as u32;
+                if b.rev != 0 {
+                    let s = sess.last_mut().unwrap();
+                    s.rev += b.rev;
+                    s.purch = true;
+                }
             }
         }
         self.cat_totals.clear();
@@ -1698,7 +1775,7 @@ fn process_person(ptr: u64, evs: &mut [TimedEvent], clicks: &mut [TimedClick], s
         return;
     }
     let bins = ((cx.we - cx.ws - 1) / GAP_MS + 1) as usize;
-    if evs.len() >= 4096 && bins <= 2048 && cx.cat_names.len() <= 256 {
+    if evs.len() >= 384 && bins <= 2048 && cx.cat_names.len() <= 256 {
         st.binned.load_sessions(evs, cx.ws, bins, cx.cat_names.len(), &mut st.sess, &mut st.runs);
     } else {
         sort_events(evs, cx.ws, cx.compact_events);
@@ -2025,11 +2102,14 @@ fn main() {
     let nthreads = nthreads.max(1);
     #[cfg(target_arch = "x86_64")]
     let (avx512, avx2) = {
-        let bmi2 = std::arch::is_x86_feature_detected!("bmi2");
+        let vector = std::arch::is_x86_feature_detected!("bmi2")
+            && std::arch::is_x86_feature_detected!("popcnt")
+            && std::arch::is_x86_feature_detected!("ssse3")
+            && std::arch::is_x86_feature_detected!("sse4.1");
         let prefer_avx2 = std::env::var_os("PIPELINE_AVX2").is_some_and(|v| v == "1");
         (
-            bmi2 && !prefer_avx2 && std::arch::is_x86_feature_detected!("avx512bw"),
-            bmi2 && std::arch::is_x86_feature_detected!("avx2"),
+            vector && !prefer_avx2 && std::arch::is_x86_feature_detected!("avx512bw"),
+            vector && std::arch::is_x86_feature_detected!("avx2"),
         )
     };
 
@@ -2067,10 +2147,15 @@ fn main() {
     }
     let day0 = floor_div(ws, DAY_MS);
     let ndays = (floor_div(we - 1, DAY_MS) - day0 + 1).max(1) as usize;
+    let ev_files = load_dir(&format!("{}/events", data));
+    let event_bytes = ev_files.iter().map(|x| x.len()).sum::<usize>();
     let cx = Ctx {
         ws,
         we,
         compact_events: we - ws <= 1 << 31 && cats.len() <= 256,
+        // Every retained event contains at least its 20-byte ingestion
+        // timestamp. Thus this also bounds both per-person count columns.
+        small_counts: event_bytes / 20 <= i32::MAX as usize,
         click_lo: ws - WEEK_MS,
         day0,
         ndays,
@@ -2082,14 +2167,13 @@ fn main() {
         cat_names: cats,
     };
 
-    let ev_files = load_dir(&format!("{}/events", data));
     let ck_files = load_dir(&format!("{}/clicks", data));
     let ln_files = load_dir(&format!("{}/links", data));
     let ev_chunks = make_chunks(&ev_files);
     let ck_chunks = make_chunks(&ck_files);
     // Capacity hints only. All arrays still grow as necessary for arbitrary
     // IDs, part sizes, and people with disproportionately many events.
-    let event_hint = ev_files.iter().map(|x| x.len()).sum::<usize>() / 72 / nthreads;
+    let event_hint = event_bytes / 72 / nthreads;
     let click_hint = ck_files.iter().map(|x| x.len()).sum::<usize>() / 46 / nthreads;
 
     std::fs::create_dir_all(format!("{}/user_daily", out)).unwrap();
@@ -2124,9 +2208,15 @@ fn main() {
                     let (fi, a, b) = ck_chunks[ti];
                     let data = &ck_files[fi][a..b];
                     #[cfg(target_arch = "x86_64")]
-                    if avx512 {
-                        unsafe { parse_clicks_fast(data, a == 0, &cx, st, lt); }
-                        return;
+                    {
+                        if avx512 {
+                            unsafe { parse_clicks_fast(data, a == 0, &cx, st, lt); }
+                            return;
+                        }
+                        if avx2 {
+                            unsafe { parse_clicks_avx2(data, a == 0, &cx, st, lt); }
+                            return;
+                        }
                     }
                     for_lines(data, a == 0, |line| {
                         if let Some(click) = parse_click(line, &cx, &mut st.dates) {
@@ -2233,7 +2323,8 @@ fn main() {
         }
     }
     if nfiles == 0 {
-        let wr = new_writer(&format!("{}/user_daily/part-0.parquet", out), USER_SCHEMA);
+        let schema = if cx.small_counts { USER_SCHEMA_SMALL } else { USER_SCHEMA };
+        let wr = new_writer(&format!("{}/user_daily/part-0.parquet", out), schema);
         wr.close().unwrap();
     }
 
@@ -2290,6 +2381,65 @@ mod tests {
     use super::{event_fields, event_ref, pack, parse_price, parse_ts, short_name, sort_events, split, split_scalar, unpack, user_code, DateCache, TimedEvent, EXACT_USER};
     #[cfg(target_arch = "x86_64")]
     use super::split_masks;
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn vector_rows_match_scalar_at_cutoffs_and_file_tail() {
+        if !(std::arch::is_x86_feature_detected!("bmi2") && std::arch::is_x86_feature_detected!("popcnt")) {
+            return;
+        }
+        #[target_feature(enable = "avx2,bmi2,popcnt")]
+        unsafe fn scan_avx2(data: &[u8]) -> Vec<Vec<Vec<u8>>> {
+            let mut rows = Vec::new();
+            super::scan_rows_avx2::<4>(data, true, |fields| {
+                rows.push(fields.iter().map(|f| f.to_vec()).collect());
+            });
+            rows
+        }
+        #[target_feature(enable = "avx512bw,bmi2,popcnt")]
+        unsafe fn scan_avx512(data: &[u8]) -> Vec<Vec<Vec<u8>>> {
+            let mut rows = Vec::new();
+            super::scan_rows_avx512::<4>(data, true, |fields| {
+                rows.push(fields.iter().map(|f| f.to_vec()).collect());
+            });
+            rows
+        }
+        let mut input = b"header,with,four,columns\n".to_vec();
+        for n in 0..260 {
+            input.extend_from_slice(format!("\"{}\",,a,\"\"\n", "x".repeat(n)).as_bytes());
+            input.extend_from_slice(format!("\"{},,a,\"\"\n", "y".repeat(n)).as_bytes());
+        }
+        input.extend_from_slice(b"end,\"last\",,field");
+        let expected: Vec<Vec<Vec<u8>>> = input.split(|&b| b == b'\n').skip(1)
+            .filter_map(split_scalar::<4>)
+            .map(|fields| fields.iter().map(|f| f.to_vec()).collect())
+            .collect();
+        if std::arch::is_x86_feature_detected!("avx2") {
+            assert_eq!(unsafe { scan_avx2(&input) }, expected);
+        }
+        if std::arch::is_x86_feature_detected!("avx512bw") {
+            assert_eq!(unsafe { scan_avx512(&input) }, expected);
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn vector_epoch_validates_every_byte() {
+        if !(std::arch::is_x86_feature_detected!("ssse3") && std::arch::is_x86_feature_detected!("sse4.1")) {
+            return;
+        }
+        let mut cache = DateCache::new();
+        for mut input in [*b"0000000000000", *b"1791071890000", *b"9999999999999"] {
+            for i in 0..input.len() {
+                let old = input[i];
+                for byte in 0..=255 {
+                    input[i] = byte;
+                    assert_eq!(super::parse_row_timestamp::<true>(&input, &mut cache), parse_ts(&input, &mut cache));
+                }
+                input[i] = old;
+            }
+        }
+    }
 
     #[test]
     fn vector_csv_matches_scalar_across_block_boundaries() {
@@ -2424,6 +2574,11 @@ mod tests {
         assert_eq!(exp_sess, got_sess);
         assert_eq!(exp_runs, got_runs);
         assert_eq!(got_runs.iter().map(|r| (r.day, r.top)).collect::<Vec<_>>(), vec![(-2, 0), (-1, 1), (0, 1)]);
+        let fewer = &sorted[..4];
+        sorted_sessions(fewer, ws, &mut exp_sess, &mut exp_runs, &mut Vec::new());
+        binner.load_sessions(fewer, ws, 80, 2, &mut got_sess, &mut got_runs);
+        assert_eq!(exp_sess, got_sess);
+        assert_eq!(exp_runs, got_runs);
     }
 
     #[test]
@@ -2564,6 +2719,13 @@ mod tests {
     #[test]
     fn split_matches_csv_dialect_on_short_lines() {
         const ALPHABET: &[u8] = b"a,\"\r";
+        #[cfg(target_arch = "x86_64")]
+        #[target_feature(enable = "bmi2,popcnt")]
+        unsafe fn split_vector<const N: usize>(line: &[u8], c: u128, q: u128) -> Option<[&[u8]; N]> {
+            super::split_masks_bmi2(line, c, q)
+        }
+        #[cfg(target_arch = "x86_64")]
+        let vector = std::arch::is_x86_feature_detected!("bmi2") && std::arch::is_x86_feature_detected!("popcnt");
         for len in 0..=7 {
             for mut code in 0..ALPHABET.len().pow(len) {
                 let mut line = vec![0; len as usize];
@@ -2583,6 +2745,11 @@ mod tests {
                     assert_eq!(split_masks::<2>(&line, commas, quotes).map(|v| v.to_vec()), reference(&line, 2), "{line:?}");
                     assert_eq!(split_masks::<4>(&line, commas, quotes).map(|v| v.to_vec()), reference(&line, 4), "{line:?}");
                     assert_eq!(split_masks::<7>(&line, commas, quotes).map(|v| v.to_vec()), reference(&line, 7), "{line:?}");
+                    if vector {
+                        assert_eq!(unsafe { split_vector::<2>(&line, commas, quotes) }.map(|v| v.to_vec()), reference(&line, 2), "{line:?}");
+                        assert_eq!(unsafe { split_vector::<4>(&line, commas, quotes) }.map(|v| v.to_vec()), reference(&line, 4), "{line:?}");
+                        assert_eq!(unsafe { split_vector::<7>(&line, commas, quotes) }.map(|v| v.to_vec()), reference(&line, 7), "{line:?}");
+                    }
                 }
             }
         }
