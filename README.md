@@ -9,20 +9,25 @@ repository.
 ## Processing
 
 - Memory-map the CSVs, scan line-aligned chunks in parallel, and validate
-  CSV syntax before deduplication. The vector parser is selected at runtime;
-  the scalar parser handles other machines and exceptional row lengths.
-- Resolve connected user IDs by union-find. Only aliases need entries in the
-  lookup table. Short ASCII IDs use an exact compact key; other IDs are
-  checked against their full bytes, not joined by hash alone.
-- Index event IDs in buckets without copying the input records. Invalid
-  candidates still take part in deduplication so an earlier invalid record
-  cannot be rescued by a later valid duplicate.
-- Group by person and sessionize their sorted events. Compute last-touch
-  attribution and distinct campaign assists in one sweep for short
-  histories, and by interval union for larger histories. Identical copies
-  of a click do not alter either the winning click or a campaign's assist.
+  CSV syntax before deduplication. Select the AVX-512 or AVX2 event scanner
+  at runtime; other CPUs and exceptional rows use the portable parser.
+- Build the linked-ID components while parsing. Only aliases need entries
+  in the lookup table. Short ASCII IDs use exact compact keys; other IDs
+  are compared by their full bytes.
+- Route event payloads directly to person shards. A separate compact index
+  retains event IDs and ingestion-order information, so deduplication
+  only marks losing copies and does not reroute payloads. Invalid
+  candidates still participate, and hash collisions are checked by byte
+  comparison.
+- Group by person and sort short histories by time. For heavy histories
+  with a bounded window, aggregate inside half-open 30-minute buckets and
+  check the exact gap between successive nonempty buckets. Compute
+  last-touch attribution and distinct campaign assists in one sweep for
+  short histories, and by interval union for larger histories. Identical
+  copies of a click do not change attribution or assists.
 - Write the Parquet parts directly. Set `PIPELINE_PROFILE=1` for per-phase
-  timings on stderr.
+  timings on stderr or `PIPELINE_AVX2=1` to test the AVX2 event scanner on
+  a machine that also supports AVX-512.
 
 ## Local verification
 
