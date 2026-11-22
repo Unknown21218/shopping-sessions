@@ -9,7 +9,7 @@ RUN cargo build --release --locked
 FROM debian:bookworm-slim
 RUN useradd --uid 1000 --no-create-home --home-dir /scratch app
 COPY --from=build /src/target/release/pipeline /app/pipeline
-ENV DATA_DIR=/data OUTPUT_DIR=/output SCRATCH_DIR=/scratch
+ENV DATA_DIR=/data OUTPUT_DIR=/output SCRATCH_DIR=/scratch NCPU=4
 USER 1000:1000
 WORKDIR /app
 CMD ["/app/pipeline"]
