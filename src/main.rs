@@ -16,11 +16,11 @@ const DAY_MS: i64 = 86_400_000;
 const WEEK_MS: i64 = 7 * DAY_MS;
 const GAP_MS: i64 = 1_800_000;
 const LATE_MS: i64 = DAY_MS;
-const B1_SHIFT: u32 = 55; // 512 buckets by event-id hash
+const B1_SHIFT: u32 = 58; // 64 buckets by event-id hash
 const B1: usize = 1 << (64 - B1_SHIFT);
-const B2_SHIFT: u32 = 55; // 512 buckets by person-key hash
+const B2_SHIFT: u32 = 58; // 64 buckets by person-key hash
 const B2: usize = 1 << (64 - B2_SHIFT);
-const CHUNK: usize = 8 << 20;
+const CHUNK: usize = 512 << 10; // 512 KB chunks for balanced multi-core scheduling
 const NO_CAT: u16 = 0xFFFF;
 
 // ---------------------------------------------------------------- utilities
@@ -45,8 +45,6 @@ fn hash_bytes(b: &[u8]) -> u64 {
     h ^= h >> 33;
     h = h.wrapping_mul(0xff51_afd7_ed55_8ccd);
     h ^= h >> 33;
-    h = h.wrapping_mul(0xc4ce_b9fe_1a85_ec53);
-    h ^= h >> 33;
     if h == 0 {
         1
     } else {
@@ -58,6 +56,7 @@ fn hash_bytes(b: &[u8]) -> u64 {
 fn pack(s: &[u8]) -> u64 {
     (s.as_ptr() as u64) | ((s.len() as u64) << 48)
 }
+
 #[inline(always)]
 fn unpack(p: u64) -> &'static [u8] {
     unsafe { std::slice::from_raw_parts((p & 0xFFFF_FFFF_FFFF) as *const u8, (p >> 48) as usize) }
@@ -69,16 +68,25 @@ fn floor_div(a: i64, b: i64) -> i64 {
 }
 
 #[inline(always)]
+fn has_quote(f: &[u8]) -> bool {
+    if f.len() <= 24 {
+        f.iter().any(|&c| c == b'"')
+    } else {
+        memchr(b'"', f).is_some()
+    }
+}
+
+#[inline(always)]
 fn unq(f: &[u8]) -> Option<&[u8]> {
     let n = f.len();
     if n >= 2 && f[0] == b'"' && f[n - 1] == b'"' {
         let inner = &f[1..n - 1];
-        if memchr(b'"', inner).is_some() {
+        if has_quote(inner) {
             None
         } else {
             Some(inner)
         }
-    } else if memchr(b'"', f).is_some() {
+    } else if has_quote(f) {
         None
     } else {
         Some(f)
@@ -124,36 +132,66 @@ fn d2(f: &[u8], i: usize) -> Option<i64> {
     }
 }
 
-fn parse_iso(f: &[u8]) -> Option<i64> {
+#[derive(Clone, Copy)]
+struct IsoDateCache {
+    date_bytes: [u8; 10],
+    day_ms: i64,
+    valid: bool,
+}
+
+impl Default for IsoDateCache {
+    fn default() -> Self {
+        Self { date_bytes: [0; 10], day_ms: 0, valid: false }
+    }
+}
+
+#[inline(always)]
+fn parse_iso_cached(f: &[u8], cache: &mut IsoDateCache) -> Option<i64> {
     let n = f.len();
     if n != 20 && n != 25 {
         return None;
     }
-    if f[4] != b'-' || f[7] != b'-' || f[10] != b'T' || f[13] != b':' || f[16] != b':' {
+    if f[10] != b'T' || f[13] != b':' || f[16] != b':' {
         return None;
     }
-    let y = d2(f, 0)? * 100 + d2(f, 2)?;
-    let mo = d2(f, 5)?;
-    let d = d2(f, 8)?;
+    let day_ms = if cache.valid && f[..10] == cache.date_bytes {
+        cache.day_ms
+    } else {
+        if f[4] != b'-' || f[7] != b'-' {
+            return None;
+        }
+        let y = d2(f, 0)? * 100 + d2(f, 2)?;
+        let mo = d2(f, 5)?;
+        let d = d2(f, 8)?;
+        if !(1..=12).contains(&mo) || d < 1 {
+            return None;
+        }
+        let leap = y % 4 == 0 && (y % 100 != 0 || y % 400 == 0);
+        let ml = match mo {
+            1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+            4 | 6 | 9 | 11 => 30,
+            _ => {
+                if leap {
+                    29
+                } else {
+                    28
+                }
+            }
+        };
+        if d > ml {
+            return None;
+        }
+        let dm = days_from_civil(y, mo, d) * 86_400_000;
+        cache.date_bytes.copy_from_slice(&f[..10]);
+        cache.day_ms = dm;
+        cache.valid = true;
+        dm
+    };
+
     let h = d2(f, 11)?;
     let mi = d2(f, 14)?;
     let s = d2(f, 17)?;
-    if !(1..=12).contains(&mo) || h > 23 || mi > 59 || s > 59 || d < 1 {
-        return None;
-    }
-    let leap = y % 4 == 0 && (y % 100 != 0 || y % 400 == 0);
-    let ml = match mo {
-        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
-        4 | 6 | 9 | 11 => 30,
-        _ => {
-            if leap {
-                29
-            } else {
-                28
-            }
-        }
-    };
-    if d > ml {
+    if h > 23 || mi > 59 || s > 59 {
         return None;
     }
     let off: i64 = if n == 20 {
@@ -177,18 +215,23 @@ fn parse_iso(f: &[u8]) -> Option<i64> {
         }
         sign * (oh * 60 + om) * 60_000
     };
-    let days = days_from_civil(y, mo, d);
-    Some((days * 86_400 + h * 3600 + mi * 60 + s) * 1000 - off)
+    Some(day_ms + (h * 3600 + mi * 60 + s) * 1000 - off)
 }
 
 #[inline(always)]
-fn parse_ts(f: &[u8]) -> Option<i64> {
-    if f.is_empty() {
+fn parse_ts(f: &[u8], cache: &mut IsoDateCache) -> Option<i64> {
+    let n = f.len();
+    if n == 0 {
         return None;
+    }
+    if n == 20 || n == 25 {
+        if f[10] == b'T' {
+            return parse_iso_cached(f, cache);
+        }
     }
     if f.iter().all(|c| c.is_ascii_digit()) {
         let mut i = 0;
-        while i < f.len() && f[i] == b'0' {
+        while i < n && f[i] == b'0' {
             i += 1;
         }
         let g = &f[i..];
@@ -201,16 +244,19 @@ fn parse_ts(f: &[u8]) -> Option<i64> {
         }
         return Some(v);
     }
-    parse_iso(f)
+    parse_iso_cached(f, cache)
 }
 
 #[inline(always)]
 fn parse_price(f: &[u8]) -> Option<u32> {
-    if f.is_empty() || !f.iter().all(|c| c.is_ascii_digit()) {
+    if f.is_empty() {
         return None;
     }
     let mut v: u64 = 0;
     for &c in f {
+        if !c.is_ascii_digit() {
+            return None;
+        }
         v = v * 10 + (c - b'0') as u64;
         if v > 10_000_000 {
             return None;
@@ -240,6 +286,22 @@ where
     M: Fn(usize) -> S + Sync,
     F: Fn(&mut S, usize) + Sync,
 {
+    par_run_fin(nthreads, ntasks, order, mk, f, |_| {})
+}
+
+fn par_run_fin<S: Send, M, F, E>(
+    nthreads: usize,
+    ntasks: usize,
+    order: Option<&[usize]>,
+    mk: M,
+    f: F,
+    fin: E,
+) -> Vec<S>
+where
+    M: Fn(usize) -> S + Sync,
+    F: Fn(&mut S, usize) + Sync,
+    E: Fn(&mut S) + Sync,
+{
     let next = AtomicUsize::new(0);
     thread::scope(|sc| {
         let hs: Vec<_> = (0..nthreads)
@@ -247,6 +309,7 @@ where
                 let next = &next;
                 let f = &f;
                 let mk = &mk;
+                let fin = &fin;
                 sc.spawn(move || {
                     let mut s = mk(t);
                     loop {
@@ -260,12 +323,24 @@ where
                         };
                         f(&mut s, task);
                     }
+                    fin(&mut s);
                     s
                 })
             })
             .collect();
         hs.into_iter().map(|h| h.join().unwrap()).collect()
     })
+}
+
+fn par_drop<T: Send>(mut items: Vec<T>) {
+    if items.is_empty() {
+        return;
+    }
+    thread::scope(|sc| {
+        for item in items.drain(..) {
+            sc.spawn(move || drop(item));
+        }
+    });
 }
 
 // ---------------------------------------------------------------- files
@@ -390,7 +465,7 @@ struct Ctx {
     camp: SmallMap, // campaign hash -> idx
     camp_ids: Vec<Vec<u8>>,
     camp_ch: Vec<Vec<u8>>,
-    cat_names: Vec<Vec<u8>>, // by rank
+    cat_ba: Vec<ByteArray>, // pre-built ByteArrays by rank (zero-alloc clone)
 }
 
 fn read_table(path: &str) -> Vec<Vec<Vec<u8>>> {
@@ -412,6 +487,7 @@ fn read_table(path: &str) -> Vec<Vec<Vec<u8>>> {
 #[repr(C)]
 struct Raw {
     eid: u64,
+    eptr: u64,
     ingest: i64,
     uh: u64,
     uptr: u64,
@@ -440,7 +516,7 @@ struct Ck {
 }
 
 #[inline(always)]
-fn parse_event(line: &[u8], cx: &Ctx) -> Option<Raw> {
+fn parse_event(line: &[u8], cx: &Ctx, cache: &mut IsoDateCache) -> Option<Raw> {
     let f = split::<7>(line)?;
     let eid = unq(f[0])?;
     let user = unq(f[1])?;
@@ -452,11 +528,22 @@ fn parse_event(line: &[u8], cx: &Ctx) -> Option<Raw> {
     if eid.is_empty() {
         return None;
     }
-    let ingest = match parse_ts(ing) {
+    let ingest = match parse_ts(ing, cache) {
         Some(v) => v,
         None => i64::MAX,
     };
-    let mut r = Raw { eid: hash_bytes(eid), ingest, uh: 0, uptr: 0, ts: 0, price: 0, cat: 0, flags: 0, _p: 0 };
+    let mut r = Raw {
+        eid: hash_bytes(eid),
+        eptr: pack(eid),
+        ingest,
+        uh: 0,
+        uptr: 0,
+        ts: 0,
+        price: 0,
+        cat: 0,
+        flags: 0,
+        _p: 0,
+    };
     if user.is_empty() || prod.is_empty() || ingest == i64::MAX {
         return Some(r);
     }
@@ -465,7 +552,7 @@ fn parse_event(line: &[u8], cx: &Ctx) -> Option<Raw> {
         b"purchase" => 3,
         _ => return Some(r),
     };
-    let t = match parse_ts(ts) {
+    let t = match parse_ts(ts, cache) {
         Some(t) if t >= cx.ws && t < cx.we => t,
         _ => return Some(r),
     };
@@ -495,6 +582,7 @@ fn parse_event(line: &[u8], cx: &Ctx) -> Option<Raw> {
 #[derive(Clone, Copy, Default)]
 struct Slot {
     key: u64,
+    kptr: u64,
     pk: u64,
     pptr: u64,
 }
@@ -504,11 +592,11 @@ struct LinkTable {
 }
 impl LinkTable {
     #[inline(always)]
-    fn get(&self, h: u64) -> Option<(u64, u64)> {
+    fn get(&self, h: u64, raw_key: &[u8]) -> Option<(u64, u64)> {
         let mut i = (h as usize) & self.mask;
         loop {
             let s = unsafe { self.slots.get_unchecked(i) };
-            if s.key == h {
+            if s.key == h && unpack(s.kptr) == raw_key {
                 return Some((s.pk, s.pptr));
             }
             if s.key == 0 {
@@ -519,6 +607,7 @@ impl LinkTable {
     }
 }
 
+#[inline(always)]
 fn find(parent: &mut [u32], mut x: u32) -> u32 {
     while parent[x as usize] != x {
         let p = parent[x as usize];
@@ -528,55 +617,74 @@ fn find(parent: &mut [u32], mut x: u32) -> u32 {
     x
 }
 
-fn build_links(files: &[&'static [u8]]) -> LinkTable {
-    let mut pairs: Vec<(u64, u64, u64, u64)> = vec![];
-    for d in files {
-        for_lines(d, true, |l| {
-            if let Some(f) = split::<2>(l) {
-                if let (Some(a), Some(b)) = (unq(f[0]), unq(f[1])) {
-                    if !a.is_empty() && !b.is_empty() {
-                        pairs.push((hash_bytes(a), pack(a), hash_bytes(b), pack(b)));
-                    }
-                }
-            }
-        });
-    }
-    if pairs.is_empty() {
+fn build_links(files: &[&'static [u8]], nthreads: usize) -> LinkTable {
+    let chunks = make_chunks(files);
+    if chunks.is_empty() {
         return LinkTable { slots: vec![Slot::default()], mask: 0 };
     }
-    let cap = (pairs.len() * 4 + 2).next_power_of_two().max(16);
+    let per_thread_pairs: Vec<Vec<(u64, u64, u64, u64)>> = par_run(
+        nthreads.min(chunks.len()).max(1),
+        chunks.len(),
+        None,
+        |_| Vec::new(),
+        |pairs, ti| {
+            let (fi, a, b) = chunks[ti];
+            for_lines(&files[fi][a..b], a == 0, |l| {
+                if let Some(f) = split::<2>(l) {
+                    if let (Some(a), Some(b)) = (unq(f[0]), unq(f[1])) {
+                        if !a.is_empty() && !b.is_empty() {
+                            pairs.push((hash_bytes(a), pack(a), hash_bytes(b), pack(b)));
+                        }
+                    }
+                }
+            });
+        },
+    );
+
+    let total_pairs: usize = per_thread_pairs.iter().map(|v| v.len()).sum();
+    if total_pairs == 0 {
+        return LinkTable { slots: vec![Slot::default()], mask: 0 };
+    }
+
+    let cap = (total_pairs * 4 + 2).next_power_of_two().max(16);
     let mask = cap - 1;
     let mut slots = vec![Slot::default(); cap];
     let mut node_of_slot = vec![0u32; cap];
-    let mut parent: Vec<u32> = Vec::with_capacity(pairs.len() * 2);
-    let mut nptr: Vec<u64> = Vec::with_capacity(pairs.len() * 2);
-    let mut nhash: Vec<u64> = Vec::with_capacity(pairs.len() * 2);
-    let mut edges: Vec<(u32, u32)> = Vec::with_capacity(pairs.len());
-    for &(ha, pa, hb, pb) in &pairs {
-        let mut ids = [0u32; 2];
-        for (k, (h, p)) in [(ha, pa), (hb, pb)].into_iter().enumerate() {
-            let mut i = (h as usize) & mask;
-            loop {
-                if slots[i].key == h {
-                    ids[k] = node_of_slot[i];
-                    break;
+    let mut parent: Vec<u32> = Vec::with_capacity(total_pairs * 2);
+    let mut nptr: Vec<u64> = Vec::with_capacity(total_pairs * 2);
+    let mut nhash: Vec<u64> = Vec::with_capacity(total_pairs * 2);
+    let mut edges: Vec<(u32, u32)> = Vec::with_capacity(total_pairs);
+
+    for pairs in &per_thread_pairs {
+        for &(ha, pa, hb, pb) in pairs {
+            let mut ids = [0u32; 2];
+            for (k, (h, p)) in [(ha, pa), (hb, pb)].into_iter().enumerate() {
+                let raw_bytes = unpack(p);
+                let mut i = (h as usize) & mask;
+                loop {
+                    if slots[i].key == h && unpack(slots[i].kptr) == raw_bytes {
+                        ids[k] = node_of_slot[i];
+                        break;
+                    }
+                    if slots[i].key == 0 {
+                        slots[i].key = h;
+                        slots[i].kptr = p;
+                        let n = parent.len() as u32;
+                        node_of_slot[i] = n;
+                        parent.push(n);
+                        nptr.push(p);
+                        nhash.push(h);
+                        ids[k] = n;
+                        break;
+                    }
+                    i = (i + 1) & mask;
                 }
-                if slots[i].key == 0 {
-                    slots[i].key = h;
-                    let n = parent.len() as u32;
-                    node_of_slot[i] = n;
-                    parent.push(n);
-                    nptr.push(p);
-                    nhash.push(h);
-                    ids[k] = n;
-                    break;
-                }
-                i = (i + 1) & mask;
             }
+            edges.push((ids[0], ids[1]));
         }
-        edges.push((ids[0], ids[1]));
     }
-    drop(pairs);
+    drop(per_thread_pairs);
+
     for &(a, b) in &edges {
         let ra = find(&mut parent, a);
         let rb = find(&mut parent, b);
@@ -613,13 +721,18 @@ fn build_links(files: &[&'static [u8]]) -> LinkTable {
 
 struct P1 {
     buckets: Vec<Vec<Raw>>,
+    cache: IsoDateCache,
 }
 struct P2 {
     ev: Vec<Vec<Ev>>,
     ck: Vec<Vec<Ck>>,
+    recs_scratch: Vec<Raw>,
+    tab_scratch: Vec<u32>,
+    cache: IsoDateCache,
 }
 
-fn parse_click(line: &[u8], cx: &Ctx, links: &LinkTable) -> Option<Ck> {
+#[inline(always)]
+fn parse_click(line: &[u8], cx: &Ctx, links: &LinkTable, cache: &mut IsoDateCache) -> Option<Ck> {
     let f = split::<4>(line)?;
     let cid = unq(f[0])?;
     let user = unq(f[1])?;
@@ -628,13 +741,13 @@ fn parse_click(line: &[u8], cx: &Ctx, links: &LinkTable) -> Option<Ck> {
     if cid.is_empty() || user.is_empty() {
         return None;
     }
-    let t = match parse_ts(ts) {
+    let t = match parse_ts(ts, cache) {
         Some(t) if t >= cx.click_lo && t < cx.we => t,
         _ => return None,
     };
     let ci = cx.camp.get(hash_bytes(camp))?;
     let uh = hash_bytes(user);
-    let key = match links.get(uh) {
+    let key = match links.get(uh, user) {
         Some((pk, _)) => pk,
         None => uh,
     };
@@ -646,27 +759,34 @@ fn dedup_bucket(b: usize, p1: &[P1], links: &LinkTable, st: &mut P2) {
     if n == 0 {
         return;
     }
-    let mut recs: Vec<Raw> = Vec::with_capacity(n);
+    st.recs_scratch.clear();
+    st.recs_scratch.reserve(n);
     for w in p1 {
-        recs.extend_from_slice(&w.buckets[b]);
+        st.recs_scratch.extend_from_slice(&w.buckets[b]);
     }
     let cap = (2 * n).next_power_of_two().max(16);
     let mask = cap - 1;
-    let mut tab: Vec<u32> = vec![u32::MAX; cap];
+    st.tab_scratch.clear();
+    st.tab_scratch.resize(cap, u32::MAX);
+
+    let recs = &mut st.recs_scratch;
+    let tab = &mut st.tab_scratch;
+
     for i in 0..n {
         let e = recs[i].eid;
+        let eb = unpack(recs[i].eptr);
         let mut s = (e as usize) & mask;
         loop {
-            let j = tab[s];
+            let j = unsafe { *tab.get_unchecked(s) };
             if j == u32::MAX {
-                tab[s] = i as u32;
+                unsafe { *tab.get_unchecked_mut(s) = i as u32 };
                 break;
             }
             let ju = j as usize;
-            if recs[ju].eid == e {
+            if recs[ju].eid == e && unpack(recs[ju].eptr) == eb {
                 if recs[i].ingest < recs[ju].ingest {
                     recs[ju].flags = 0;
-                    tab[s] = i as u32;
+                    unsafe { *tab.get_unchecked_mut(s) = i as u32 };
                 } else {
                     recs[i].flags = 0;
                 }
@@ -675,11 +795,11 @@ fn dedup_bucket(b: usize, p1: &[P1], links: &LinkTable, st: &mut P2) {
             s = (s + 1) & mask;
         }
     }
-    for r in &recs {
+    for r in recs.iter() {
         if r.flags & F_VALID == 0 {
             continue;
         }
-        let (key, ptr) = match links.get(r.uh) {
+        let (key, ptr) = match links.get(r.uh, unpack(r.uptr)) {
             Some(v) => v,
             None => (r.uh, r.uptr),
         };
@@ -784,14 +904,14 @@ fn flush_user_rows(st: &mut W3, cx: &Ctx, out_dir: &str) {
     }
     {
         let mut c = rg.next_column().unwrap().unwrap();
-        let mut vals: Vec<ByteArray> = Vec::new();
+        let mut vals: Vec<ByteArray> = Vec::with_capacity(st.rows.len());
         let mut defs: Vec<i16> = Vec::with_capacity(st.rows.len());
         for r in &st.rows {
             if r.top == NO_CAT {
                 defs.push(0);
             } else {
                 defs.push(1);
-                vals.push(ByteArray::from(cx.cat_names[r.top as usize].clone()));
+                vals.push(cx.cat_ba[r.top as usize].clone());
             }
         }
         c.typed::<ByteArrayType>().write_batch(&vals, Some(&defs), None).unwrap();
@@ -932,6 +1052,7 @@ fn add_assist(st: &mut W3, cx: &Ctx, camp: usize, a: usize, b: usize) {
     }
 }
 
+#[inline(always)]
 fn top_cat(c: &[(u16, i64)]) -> u16 {
     let mut best = NO_CAT;
     let mut bs = i64::MIN;
@@ -984,7 +1105,7 @@ fn phase3_bucket(b: usize, p2: &[P2], st: &mut W3, cx: &Ctx, out_dir: &str) {
     }
     st.evbuf = evbuf;
     st.ckbuf = ckbuf;
-    if st.rows.len() >= 200_000 {
+    if st.rows.len() >= 100_000 {
         flush_user_rows(st, cx, out_dir);
     }
 }
@@ -1001,8 +1122,9 @@ fn main() {
     let nthreads = nthreads.max(1);
 
     let manifest = std::fs::read_to_string(format!("{}/manifest.json", data)).expect("manifest");
-    let ws = parse_ts(json_str(&manifest, "window_start").as_bytes()).expect("window_start");
-    let we = parse_ts(json_str(&manifest, "window_end").as_bytes()).expect("window_end");
+    let mut ts_cache = IsoDateCache::default();
+    let ws = parse_ts(json_str(&manifest, "window_start").as_bytes(), &mut ts_cache).expect("window_start");
+    let we = parse_ts(json_str(&manifest, "window_end").as_bytes(), &mut ts_cache).expect("window_end");
 
     // products, campaigns
     let prows = read_table(&format!("{}/products.csv", data));
@@ -1019,6 +1141,8 @@ fn main() {
         prod.insert(hash_bytes(&r[0]), rank_of(&r[1]));
     }
     let unknown_rank = rank_of(b"unknown") as u16;
+    let cat_ba: Vec<ByteArray> = cats.iter().map(|c| ByteArray::from(c.clone())).collect();
+
     let crows = read_table(&format!("{}/campaigns.csv", data));
     let mut camp = SmallMap::new(crows.len());
     let mut camp_ids = vec![];
@@ -1045,7 +1169,7 @@ fn main() {
         camp,
         camp_ids,
         camp_ch,
-        cat_names: cats.clone(),
+        cat_ba,
     };
 
     let ev_files = load_dir(&format!("{}/events", data));
@@ -1057,25 +1181,25 @@ fn main() {
     std::fs::create_dir_all(format!("{}/user_daily", out)).unwrap();
     std::fs::create_dir_all(format!("{}/campaign_daily", out)).unwrap();
 
-    // phase 1: parse events (+ links in a side thread)
-    let (links, p1): (LinkTable, Vec<P1>) = thread::scope(|sc| {
-        let lh = sc.spawn(|| build_links(&ln_files));
-        let p1 = par_run(
-            nthreads,
-            ev_chunks.len(),
-            None,
-            |_| P1 { buckets: (0..B1).map(|_| Vec::new()).collect() },
-            |st, ti| {
-                let (fi, a, b) = ev_chunks[ti];
-                for_lines(&ev_files[fi][a..b], a == 0, |l| {
-                    if let Some(r) = parse_event(l, &cx) {
-                        st.buckets[(r.eid >> B1_SHIFT) as usize].push(r);
-                    }
-                });
-            },
-        );
-        (lh.join().unwrap(), p1)
-    });
+    // phase 1: parse events + parallel union-find over links
+    let links = build_links(&ln_files, nthreads);
+    let p1: Vec<P1> = par_run(
+        nthreads,
+        ev_chunks.len(),
+        None,
+        |_| P1 {
+            buckets: (0..B1).map(|_| Vec::new()).collect(),
+            cache: IsoDateCache::default(),
+        },
+        |st, ti| {
+            let (fi, a, b) = ev_chunks[ti];
+            for_lines(&ev_files[fi][a..b], a == 0, |l| {
+                if let Some(r) = parse_event(l, &cx, &mut st.cache) {
+                    st.buckets[(r.eid >> B1_SHIFT) as usize].push(r);
+                }
+            });
+        },
+    );
 
     // phase 2: clicks + dedup buckets
     let nck = ck_chunks.len();
@@ -1083,12 +1207,18 @@ fn main() {
         nthreads,
         nck + B1,
         None,
-        |_| P2 { ev: (0..B2).map(|_| Vec::new()).collect(), ck: (0..B2).map(|_| Vec::new()).collect() },
+        |_| P2 {
+            ev: (0..B2).map(|_| Vec::new()).collect(),
+            ck: (0..B2).map(|_| Vec::new()).collect(),
+            recs_scratch: Vec::new(),
+            tab_scratch: Vec::new(),
+            cache: IsoDateCache::default(),
+        },
         |st, ti| {
             if ti < nck {
                 let (fi, a, b) = ck_chunks[ti];
                 for_lines(&ck_files[fi][a..b], a == 0, |l| {
-                    if let Some(c) = parse_click(l, &cx, &links) {
+                    if let Some(c) = parse_click(l, &cx, &links, &mut st.cache) {
                         st.ck[(c.key >> B2_SHIFT) as usize].push(c);
                     }
                 });
@@ -1097,15 +1227,15 @@ fn main() {
             }
         },
     );
-    drop(p1);
+    par_drop(p1);
     drop(links);
 
-    // phase 3: sessions, attribution, output
+    // phase 3: sessions, attribution, parallel Parquet output
     let mut sizes: Vec<(usize, usize)> = (0..B2).map(|b| (p2.iter().map(|w| w.ev[b].len()).sum::<usize>(), b)).collect();
     sizes.sort_by(|a, b| b.0.cmp(&a.0));
     let order: Vec<usize> = sizes.iter().map(|x| x.1).collect();
     let nc1 = cx.camp_ids.len() + 1;
-    let w3s: Vec<W3> = par_run(
+    let w3s: Vec<W3> = par_run_fin(
         nthreads,
         B2,
         Some(&order),
@@ -1123,16 +1253,18 @@ fn main() {
             tmp: Vec::new(),
         },
         |st, b| phase3_bucket(b, &p2, st, &cx, &out),
+        |st| {
+            flush_user_rows(st, &cx, &out);
+            if let Some(wr) = st.writer.take() {
+                wr.close().unwrap();
+            }
+        },
     );
-    drop(p2);
+    par_drop(p2);
 
     let mut total = vec![[0i64; 4]; nc1 * ndays];
     let mut nfiles = 0;
-    for mut w in w3s {
-        flush_user_rows(&mut w, &cx, &out);
-        if let Some(wr) = w.writer.take() {
-            wr.close().unwrap();
-        }
+    for w in w3s {
         nfiles += w.nfiles;
         for (t, a) in total.iter_mut().zip(w.acc.iter()) {
             for k in 0..4 {

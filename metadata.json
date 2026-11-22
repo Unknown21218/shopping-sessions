@@ -1,0 +1,5 @@
+{
+  "name": "Shopping Sessions Pipeline",
+  "description": "Multi-phase shopping sessionization, identity resolution, event deduplication, and campaign attribution pipeline migrated from Rust to Node.js and React.",
+  "requestFramePermissions": []
+}
